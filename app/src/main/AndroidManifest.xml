@@ -32,6 +32,11 @@
             android:foregroundServiceType="mediaProjection" />
 
         <service
+            android:name=".service.FloatingHudService"
+            android:enabled="true"
+            android:exported="false" />
+
+        <service
             android:name=".service.AutoTouchAccessibilityService"
             android:exported="false"
             android:label="@string/accessibility_service_label"

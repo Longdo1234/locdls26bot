@@ -1,10 +1,16 @@
-# DLS26 Tactical AutoBot (Android APK — No Root)
+# DLS26 Tactical AutoBot (Android APK — No Root, Landscape)
 
-Ứng dụng Android tự động chơi **Dream League Soccer 2026 (DLS 26)** dựa trên thị giác máy tính (**OpenCV 4.9.0** từ Maven Central), quét **Minimap & Sa bàn** thời gian thực qua `MediaProjection` + `ImageReader` (15–20 FPS) và giả lập cảm ứng đa điểm mượt mà bằng `AccessibilityService.dispatchGesture`.
+Ứng dụng Android tự động chơi **Dream League Soccer 2026 (DLS 26)** ở chế độ màn hình ngang (**Landscape**) không cần Root:
+- **Nhận diện Minimap & Sa bàn (OpenCV 4.9.0 Maven Central)**: Nhận diện toàn bộ chấm **Áo đỏ** (cầu thủ + Thủ môn áo đỏ) làm **Team của mình**, tự động xác định vị trí **Thủ môn áo đỏ** và tấn công về phía ngược lại.
+- **Giả lập cảm ứng đa điểm mượt mà (`AccessibilityService.dispatchGesture`)**: Duy trì kéo Joystick liên tục bằng chuỗi `continueStroke(..., willContinue = true)` qua callback `onCompleted()` kết hợp **Multi-Touch** bấm đồng thời các nút chuẩn DLS 26:
+  - **Nút A**: Sút bóng (Tấn công) / Xoạc bóng (Phòng ngự)
+  - **Nút B**: Chuyền thấp (Tấn công) / Áp sát (Phòng ngự)
+  - **Nút C**: Chuyền bổng, tạt cánh (Tấn công) / Đổi người (Phòng ngự)
+- **HUD nổi tích hợp nút Cài đặt (`⚙️`) ngay trong game**: Chỉnh chiến thuật, đảo hướng tấn công, kéo slider hoặc kéo thả chấm neo ROI/nút A-B-C trực tiếp đè lên game không cần thoát ra ngoài.
 
-## 1. Cách Fork / Push lên GitHub & Tải file APK tự động
+## 1. Cách Push lên GitHub & Tải file APK tự động
 
-1. **Tạo repository mới trên GitHub** (hoặc Fork repo này), giải nén toàn bộ mã nguồn và push lên nhánh `main` (hoặc `master`):
+1. Giải nén dự án và push lên nhánh `main` (hoặc `master`) của repository GitHub của bạn:
    ```bash
    git init
    git add .
@@ -13,29 +19,18 @@
    git remote add origin https://github.com/<username>/<repo>.git
    git push -u origin main
    ```
-2. Mở tab **Actions** trên GitHub -> chọn workflow **Build DLS26 Tactical AutoBot APK** đang chạy.
-3. Sau khi build hoàn tất (~2–3 phút), cuộn xuống mục **Artifacts** và tải về **`DLS26-Tactical-AutoBot-debug-apk`** -> giải nén để lấy file `app-debug.apk`.
-4. *(Tùy chọn)* Để tự động tạo **GitHub Release** kèm file APK, gắn tag phiên bản và push:
-   ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
-   ```
+2. Vào tab **Actions** trên GitHub -> chọn workflow **Build DLS26 Tactical AutoBot APK** -> tải artifact **`DLS26-Tactical-AutoBot-debug-apk`** để lấy file `app-debug.apk`.
+3. *(Tùy chọn)* Gắn tag `v1.0.0` và push để tự động tạo **GitHub Release** đính kèm file `.apk`.
 
 ## 2. Hướng dẫn cài đặt & cấp quyền trên Android 13 / 14 / 15
 
-Vì file APK được cài trực tiếp ngoài Google Play Store, Android 13+ sẽ khóa quyền **Accessibility** theo cơ chế **Restricted Settings (Cài đặt bị hạn chế)**. Thực hiện theo 3 bước sau:
+1. Cài đặt `app-debug.apk` từ bộ nhớ máy.
+2. **Mở khóa Restricted Settings (nếu công tắc Accessibility bị khóa xám)**:
+   - Mở app **DLS26 Tactical AutoBot** -> bấm nút **Mở Thông tin ứng dụng (Bật Restricted Settings)**.
+   - Chạm biểu tượng **3 dấu chấm (`⋮`)** góc trên phải -> chọn **Cho phép cài đặt bị hạn chế (Allow restricted settings)** -> xác thực PIN/vân tay.
+3. Quay lại app cấp đủ 4 quyền: **Overlay**, **Accessibility**, **Thông báo**, và bấm **KHỞI ĐỘNG BOT** để cấp quyền **MediaProjection**.
 
-1. **Cài đặt APK**: Mở `app-debug.apk` trên điện thoại và cho phép cài từ nguồn không xác định.
-2. **Mở khóa Restricted Settings (Android 13/14/15)**:
-   - Vào **Cài đặt (Settings) -> Ứng dụng (Apps) -> Xem tất cả ứng dụng -> DLS26 Tactical AutoBot**.
-   - Nhấn vào biểu tượng **3 dấu chấm (`⋮`)** ở góc trên bên phải -> chọn **Cho phép cài đặt bị hạn chế (Allow restricted settings)** -> xác thực vân tay / mã PIN.
-3. **Cấp đủ 4 quyền trong ứng dụng**:
-   - **Overlay (`SYSTEM_ALERT_WINDOW`)**: Hiển thị thanh điều khiển nổi & Debug Overlay.
-   - **Accessibility (`DLS26 Tactical AutoBot Touch`)**: Vào *Trợ năng -> Ứng dụng đã tải xuống* và bật công tắc.
-   - **Thông báo (`POST_NOTIFICATIONS`)**: Duy trì Foreground Service ổn định.
-   - **Quay màn hình (`MediaProjection`)**: Chấp nhận hộp thoại hệ thống khi bấm **KHỞI ĐỘNG BOT**.
+## 3. Sử dụng trong game DLS 26
 
-## 3. Mẹo căn chỉnh ROI & Chạy hiệu quả
-
-- Mở DLS 26 ở chế độ ngang (Landscape), sau đó bấm **Hiệu chuẩn tọa độ (ROI Calibration)** để kéo chính xác khung `MINIMAP ROI` bao trọn bản đồ radar và đặt các điểm `JOY`, `A`, `B`, `C`, `NEXT` trùng khớp với nút trên màn hình máy bạn (tương thích 16:9, 19.5:9, 20:9).
-- Bật **Debug Overlay** trong 1–2 phút đầu để kiểm tra chấm cầu thủ phe ta (Xanh), đối thủ (Đỏ), bóng (Vàng) và mũi tên hướng di chuyển AI trước khi tắt HUD để tiết kiệm pin.
+- Vào trận đấu DLS 26 (màn hình ngang), bấm **⚙️ Cài đặt** trên thanh HUD nổi -> chọn **🎯 Kéo thả chấm neo ROI & Nút A / B / C** để căn khớp khung `MINIMAP ROI`, tâm `JOY` và 3 nút `A`, `B`, `C`, sau đó bấm **Lưu ROI**.
+- Bấm **▶ RUN** trên thanh HUD để bot tự động thi đấu; bật **Debug Overlay** để quan sát chấm đỏ phe ta, vòng vàng Thủ môn đỏ (`GK`) và mũi tên hướng tấn công.

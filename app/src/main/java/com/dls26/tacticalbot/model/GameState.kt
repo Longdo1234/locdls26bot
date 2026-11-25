@@ -21,9 +21,11 @@ data class MinimapDetection(
     val ballVx: Float,
     val ballVy: Float,
     val activePlayer: NormalizedPoint?,
+    val redGoalkeeperNorm: NormalizedPoint?,
     val rawAlliesScreen: List<ScreenPoint>,
     val rawOpponentsScreen: List<ScreenPoint>,
     val rawBallScreen: ScreenPoint?,
+    val rawRedGoalkeeperScreen: ScreenPoint?,
     val attackingRight: Boolean,
     val minimapConfidence: Float
 )

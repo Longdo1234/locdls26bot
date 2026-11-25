@@ -27,25 +27,39 @@ class DebugOverlayView(context: Context) : View(context) {
         strokeWidth = 3f
     }
 
-    private val allyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#22C55E")
-        style = Paint.Style.FILL
-    }
-
-    private val opponentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // My Team = Red Kit
+    private val allyRedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#EF4444")
         style = Paint.Style.FILL
     }
 
-    private val ballPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val gkRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#FACC15")
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+
+    private val opponentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#38BDF8")
+        style = Paint.Style.FILL
+    }
+
+    private val ballPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#FDE047")
         style = Paint.Style.FILL
     }
 
     private val vectorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#38BDF8")
+        color = Color.parseColor("#22C55E")
         style = Paint.Style.STROKE
         strokeWidth = 6f
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    private val attackArrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#F59E0B")
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
         strokeCap = Paint.Cap.ROUND
     }
 
@@ -67,13 +81,13 @@ class DebugOverlayView(context: Context) : View(context) {
 
     private val hudTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
-        textSize = 28f
+        textSize = 26f
         isFakeBoldText = true
     }
 
     private val labelTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
-        textSize = 24f
+        textSize = 22f
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
     }
@@ -110,16 +124,34 @@ class DebugOverlayView(context: Context) : View(context) {
         )
         canvas.drawRect(mmRect, roiBoxPaint)
 
-        // 2. Minimap Detected Dots (Ally=Green, Opponent=Red, Ball=Yellow)
+        // 2. Minimap Detected Entities
         if (state != null) {
             for (pt in state.minimap.rawAlliesScreen) {
-                canvas.drawCircle(pt.x, pt.y, 7f, allyPaint)
+                canvas.drawCircle(pt.x, pt.y, 7f, allyRedPaint)
+            }
+            state.minimap.rawRedGoalkeeperScreen?.let { gk ->
+                canvas.drawCircle(gk.x, gk.y, 13f, gkRingPaint)
+                canvas.drawText("GK", gk.x, gk.y - 16f, labelTextPaint)
             }
             for (pt in state.minimap.rawOpponentsScreen) {
                 canvas.drawCircle(pt.x, pt.y, 7f, opponentPaint)
             }
             state.minimap.rawBallScreen?.let { ballPt ->
                 canvas.drawCircle(ballPt.x, ballPt.y, 9f, ballPaint)
+            }
+
+            // Attack Direction Arrow above Minimap (opposite Red Goalkeeper)
+            val arrowY = (mmRect.top - 18f).coerceAtLeast(110f)
+            val arrowLen = 84f
+            val cx = mmRect.centerX()
+            if (state.minimap.attackingRight) {
+                canvas.drawLine(cx - arrowLen / 2f, arrowY, cx + arrowLen / 2f, arrowY, attackArrowPaint)
+                canvas.drawLine(cx + arrowLen / 2f - 14f, arrowY - 10f, cx + arrowLen / 2f, arrowY, attackArrowPaint)
+                canvas.drawLine(cx + arrowLen / 2f - 14f, arrowY + 10f, cx + arrowLen / 2f, arrowY, attackArrowPaint)
+            } else {
+                canvas.drawLine(cx + arrowLen / 2f, arrowY, cx - arrowLen / 2f, arrowY, attackArrowPaint)
+                canvas.drawLine(cx - arrowLen / 2f + 14f, arrowY - 10f, cx - arrowLen / 2f, arrowY, attackArrowPaint)
+                canvas.drawLine(cx - arrowLen / 2f + 14f, arrowY + 10f, cx - arrowLen / 2f, arrowY, attackArrowPaint)
             }
         }
 
@@ -149,21 +181,23 @@ class DebugOverlayView(context: Context) : View(context) {
         val aiState = action?.state?.name ?: "IDLE"
         val sceneStr = state?.scene?.name ?: "WAIT"
         val possStr = state?.possession?.name ?: "-"
+        val dirStr = if (state?.minimap?.attackingRight == false) "ATK ←" else "ATK →"
         val fps = state?.currentFps ?: 0f
         val lat = state?.processingLatencyMs ?: 0L
         val alliesCount = state?.minimap?.allies?.size ?: 0
         val oppsCount = state?.minimap?.opponents?.size ?: 0
 
-        val hudLine1 = "[$statusStr] $aiState | $sceneStr ($possStr)"
-        val hudLine2 = "FPS: ${"%.1f".format(fps)} | ${lat}ms | Ally:$alliesCount Opp:$oppsCount | ${action?.debugNote ?: ""}"
+        val hudLine1 = "[$statusStr] $aiState | $dirStr | $sceneStr ($possStr)"
+        val hudLine2 = "FPS:${"%.1f".format(fps)} ${lat}ms | Red:$alliesCount Opp:$oppsCount | ${action?.debugNote ?: ""}"
 
-        val bannerWidth = min(w - 40f, 820f)
+        val bannerWidth = min(w - 40f, 860f)
         val bannerLeft = (w - bannerWidth) / 2f
-        val bannerRect = RectF(bannerLeft, 14f, bannerLeft + bannerWidth, 94f)
+        val bannerRect = RectF(bannerLeft, 12f, bannerLeft + bannerWidth, 92f)
         canvas.drawRoundRect(bannerRect, 14f, 14f, hudBgPaint)
-        canvas.drawText(hudLine1, bannerLeft + 18f, 46f, hudTextPaint)
-        canvas.drawText(hudLine2, bannerLeft + 18f, 80f, hudTextPaint.apply { textSize = 22f })
-        hudTextPaint.textSize = 28f
+        hudTextPaint.textSize = 25f
+        canvas.drawText(hudLine1, bannerLeft + 18f, 44f, hudTextPaint)
+        hudTextPaint.textSize = 21f
+        canvas.drawText(hudLine2, bannerLeft + 18f, 78f, hudTextPaint)
     }
 
     private fun drawButtonMarker(

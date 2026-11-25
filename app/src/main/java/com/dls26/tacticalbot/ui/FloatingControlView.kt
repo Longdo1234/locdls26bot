@@ -14,14 +14,14 @@ import kotlin.math.abs
 class FloatingControlView(
     context: Context,
     private val onTogglePlay: () -> Unit,
-    private val onToggleDebug: () -> Unit,
+    private val onOpenSettings: () -> Unit,
     private val onStopService: () -> Unit,
     private val onDragBy: (dx: Int, dy: Int) -> Unit
 ) : LinearLayout(context) {
 
     private var isPlaying = false
     private val playButton: TextView
-    private val debugButton: TextView
+    private val settingsButton: TextView
     private val stopButton: TextView
 
     private var lastRawX = 0f
@@ -32,37 +32,42 @@ class FloatingControlView(
         orientation = HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         setBackgroundResource(R.drawable.bg_pill)
-        setPadding(18, 10, 18, 10)
+        setPadding(16, 10, 16, 10)
 
         val dragHandle = TextView(context).apply {
             text = "⠿"
             setTextColor(Color.parseColor("#94A3B8"))
             textSize = 18f
-            setPadding(4, 0, 14, 0)
+            setPadding(4, 0, 12, 0)
         }
 
         playButton = createChip("▶ RUN", "#10B981")
-        debugButton = createChip("HUD", "#06B6D4")
+        settingsButton = createChip("⚙ Cài đặt", "#06B6D4")
         stopButton = createChip("✕", "#EF4444")
 
         playButton.setOnClickListener {
             isPlaying = !isPlaying
-            playButton.text = if (isPlaying) "⏸ PAUSE" else "▶ RUN"
-            playButton.setTextColor(
-                if (isPlaying) Color.parseColor("#F59E0B") else Color.parseColor("#10B981")
-            )
+            updatePlayVisual(isPlaying)
             onTogglePlay()
         }
 
-        debugButton.setOnClickListener { onToggleDebug() }
+        settingsButton.setOnClickListener { onOpenSettings() }
         stopButton.setOnClickListener { onStopService() }
 
         addView(dragHandle)
         addView(playButton)
-        addView(debugButton)
+        addView(settingsButton)
         addView(stopButton)
 
         dragHandle.setOnTouchListener { _, event -> handleDrag(event) }
+    }
+
+    fun updatePlayVisual(playing: Boolean) {
+        isPlaying = playing
+        playButton.text = if (isPlaying) "⏸ PAUSE" else "▶ RUN"
+        playButton.setTextColor(
+            if (isPlaying) Color.parseColor("#F59E0B") else Color.parseColor("#10B981")
+        )
     }
 
     private fun createChip(label: String, colorHex: String): TextView {

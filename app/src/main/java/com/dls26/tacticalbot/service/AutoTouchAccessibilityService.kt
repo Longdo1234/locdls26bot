@@ -3,19 +3,50 @@ package com.dls26.tacticalbot.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import com.dls26.tacticalbot.config.BotConfig
 import com.dls26.tacticalbot.model.ActionButton
 import com.dls26.tacticalbot.model.BotAction
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
+/**
+ * Callback-chained Multi-Touch Gesture Controller for DLS 26:
+ * - Keeps the virtual thumb continuously pressed on the joystick via `continueStroke(..., willContinue = true)`
+ *   chained inside `GestureResultCallback.onCompleted()` at 55-75ms steps so DLS 26 never resets the stick.
+ * - Combines Joystick Stroke + Action Button Stroke (A/B/C) into ONE `GestureDescription`
+ *   so simultaneous movement + pass/shoot/press/cross works without gesture cancellation.
+ * - Strictly clamps every coordinate inside [1f, screenWidth - 1f] x [1f, screenHeight - 1f].
+ */
 class AutoTouchAccessibilityService : AccessibilityService() {
 
-    private val isDispatching = AtomicBoolean(false)
+    private data class PendingCommand(
+        val action: BotAction,
+        val config: BotConfig,
+        val screenWidth: Int,
+        val screenHeight: Int,
+        val stepDurationMs: Long,
+        val updatedAtMs: Long
+    )
+
+    private data class PendingButton(
+        val button: ActionButton,
+        val holdMs: Long,
+        val queuedAtMs: Long
+    )
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val isLoopRunning = AtomicBoolean(false)
+    private val latestCommand = AtomicReference<PendingCommand?>(null)
+    private val queuedButton = AtomicReference<PendingButton?>(null)
+
     private var activeJoystickStroke: GestureDescription.StrokeDescription? = null
     private var lastJoyX: Float = 0f
     private var lastJoyY: Float = 0f
@@ -23,149 +54,221 @@ class AutoTouchAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        Log.i(TAG, "AutoTouchAccessibilityService connected.")
+        Log.i(TAG, "AutoTouchAccessibilityService connected (canPerformGestures=true).")
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Not needed; gestures are driven directly by ScreenCaptureService vision loop.
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
 
     override fun onInterrupt() {
-        releaseJoystick()
+        stopAndReleaseJoystick()
     }
 
     override fun onDestroy() {
-        releaseJoystick()
+        stopAndReleaseJoystick()
         if (instance === this) {
             instance = null
         }
         super.onDestroy()
     }
 
-    fun executeAction(
+    fun submitAction(
         action: BotAction,
         config: BotConfig,
         screenWidth: Int,
         screenHeight: Int,
         frameIntervalMs: Long
     ) {
-        if (!isDispatching.compareAndSet(false, true)) {
+        val now = System.currentTimeMillis()
+        val safeW = max(screenWidth, screenHeight)
+        val safeH = min(screenWidth, screenHeight)
+
+        latestCommand.set(
+            PendingCommand(
+                action = action,
+                config = config,
+                screenWidth = safeW,
+                screenHeight = safeH,
+                stepDurationMs = frameIntervalMs.coerceIn(50L, 80L),
+                updatedAtMs = now
+            )
+        )
+
+        if (action.button != ActionButton.NONE) {
+            queuedButton.set(PendingButton(action.button, action.buttonHoldMs, now))
+        }
+
+        if (isLoopRunning.compareAndSet(false, true)) {
+            mainHandler.post { dispatchNextChainedStep() }
+        }
+    }
+
+    fun stopAndReleaseJoystick() {
+        latestCommand.set(null)
+        queuedButton.set(null)
+        mainHandler.post {
+            val stroke = activeJoystickStroke
+            activeJoystickStroke = null
+            if (stroke != null) {
+                try {
+                    val path = Path().apply {
+                        moveTo(lastJoyX, lastJoyY)
+                        lineTo(lastJoyX, lastJoyY)
+                    }
+                    val endStroke = stroke.continueStroke(path, 0L, 35L, false)
+                    val gesture = GestureDescription.Builder().addStroke(endStroke).build()
+                    dispatchGesture(gesture, null, null)
+                } catch (_: Exception) {
+                    // Service may already be tearing down
+                }
+            }
+            isLoopRunning.set(false)
+        }
+    }
+
+    private fun dispatchNextChainedStep() {
+        val cmd = latestCommand.get()
+        val now = System.currentTimeMillis()
+
+        // If no fresh command for > 450ms, cleanly lift virtual thumb and pause loop
+        if (cmd == null || (now - cmd.updatedAtMs) > 450L) {
+            releaseActiveStrokeAndStopLoop()
+            return
+        }
+
+        val w = cmd.screenWidth.toFloat().coerceAtLeast(100f)
+        val h = cmd.screenHeight.toFloat().coerceAtLeast(100f)
+        val cfg = cmd.config
+        val action = cmd.action
+
+        // Pop any fresh queued button press (discard stale > 300ms)
+        val btnItem = queuedButton.getAndSet(null)?.takeIf { (now - it.queuedAtMs) <= 300L }
+
+        val buttonHoldMs = btnItem?.holdMs?.coerceIn(50L, 380L) ?: 0L
+        val stepMs = max(cmd.stepDurationMs, buttonHoldMs).coerceIn(50L, 380L)
+
+        val builder = GestureDescription.Builder()
+        var hasStroke = false
+
+        // 1. Continuous Joystick Stroke (Stroke 1)
+        val joyCenterX = (cfg.joystickCenterX * w).coerceIn(1f, w - 1f)
+        val joyCenterY = (cfg.joystickCenterY * h).coerceIn(1f, h - 1f)
+        val joyRadius = cfg.joystickRadiusNorm * min(w, h)
+
+        if (action.joystickActive) {
+            val targetX = (joyCenterX + cos(action.joystickAngleRad) * joyRadius * action.joystickMagnitude)
+                .coerceIn(1f, w - 1f)
+            val targetY = (joyCenterY + sin(action.joystickAngleRad) * joyRadius * action.joystickMagnitude)
+                .coerceIn(1f, h - 1f)
+
+            val prev = activeJoystickStroke
+            val path = Path()
+            val nextStroke = if (prev == null) {
+                // Anchor virtual thumb at joystick center, then drag smoothly to target
+                path.moveTo(joyCenterX, joyCenterY)
+                path.lineTo(targetX, targetY)
+                GestureDescription.StrokeDescription(path, 0L, stepMs, true)
+            } else {
+                // Continue seamlessly from previous thumb coordinate without lifting
+                val smoothMidX = (lastJoyX + (targetX - lastJoyX) * 0.6f).coerceIn(1f, w - 1f)
+                val smoothMidY = (lastJoyY + (targetY - lastJoyY) * 0.6f).coerceIn(1f, h - 1f)
+                path.moveTo(lastJoyX.coerceIn(1f, w - 1f), lastJoyY.coerceIn(1f, h - 1f))
+                path.quadTo(smoothMidX, smoothMidY, targetX, targetY)
+                prev.continueStroke(path, 0L, stepMs, true)
+            }
+
+            activeJoystickStroke = nextStroke
+            lastJoyX = targetX
+            lastJoyY = targetY
+            builder.addStroke(nextStroke)
+            hasStroke = true
+        } else if (activeJoystickStroke != null) {
+            // Gracefully release thumb when entering MENU / IDLE
+            val releasePath = Path().apply {
+                moveTo(lastJoyX.coerceIn(1f, w - 1f), lastJoyY.coerceIn(1f, h - 1f))
+                lineTo(joyCenterX, joyCenterY)
+            }
+            val endStroke = activeJoystickStroke!!.continueStroke(releasePath, 0L, 40L, false)
+            activeJoystickStroke = null
+            builder.addStroke(endStroke)
+            hasStroke = true
+        }
+
+        // 2. Simultaneous Multi-Touch Action Button Stroke (Stroke 2)
+        if (btnItem != null && btnItem.button != ActionButton.NONE) {
+            val (bxNorm, byNorm) = when (btnItem.button) {
+                ActionButton.A_SHOOT_OR_TACKLE -> cfg.buttonAX to cfg.buttonAY
+                ActionButton.B_LOW_PASS_OR_PRESS -> cfg.buttonBX to cfg.buttonBY
+                ActionButton.C_LOFTED_PASS_OR_SWITCH -> cfg.buttonCX to cfg.buttonCY
+                ActionButton.MENU_CONTINUE -> cfg.continueBtnX to cfg.continueBtnY
+                ActionButton.NONE -> 0.5f to 0.5f
+            }
+            val bx = (bxNorm * w).coerceIn(1f, w - 1f)
+            val by = (byNorm * h).coerceIn(1f, h - 1f)
+            val bxEnd = (bx + 1f).coerceIn(1f, w - 1f)
+            val byEnd = (by + 1f).coerceIn(1f, h - 1f)
+
+            val btnPath = Path().apply {
+                moveTo(bx, by)
+                lineTo(bxEnd, byEnd)
+            }
+            val btnStroke = GestureDescription.StrokeDescription(btnPath, 0L, buttonHoldMs, false)
+            builder.addStroke(btnStroke)
+            hasStroke = true
+        }
+
+        if (!hasStroke) {
+            isLoopRunning.set(false)
             return
         }
 
         try {
-            val builder = GestureDescription.Builder()
-            var hasAnyStroke = false
-
-            // 1. Continuous Smooth Joystick Stroke
-            val centerX = (config.joystickCenterX * screenWidth).coerceIn(10f, screenWidth - 10f)
-            val centerY = (config.joystickCenterY * screenHeight).coerceIn(10f, screenHeight - 10f)
-            val radiusPx = config.joystickRadiusNorm * min(screenWidth, screenHeight)
-
-            if (action.joystickActive) {
-                val targetX = (centerX + cos(action.joystickAngleRad) * radiusPx * action.joystickMagnitude)
-                    .coerceIn(5f, screenWidth - 5f)
-                val targetY = (centerY + sin(action.joystickAngleRad) * radiusPx * action.joystickMagnitude)
-                    .coerceIn(5f, screenHeight - 5f)
-
-                val strokeDuration = frameIntervalMs.coerceIn(45L, 90L)
-                val prevStroke = activeJoystickStroke
-                val path = Path()
-                val nextStroke = if (prevStroke == null) {
-                    path.moveTo(centerX, centerY)
-                    path.lineTo(targetX, targetY)
-                    GestureDescription.StrokeDescription(path, 0L, strokeDuration, true)
-                } else {
-                    // Smooth interpolation from last thumb coordinate to new target
-                    val midX = lastJoyX + (targetX - lastJoyX) * 0.65f
-                    val midY = lastJoyY + (targetY - lastJoyY) * 0.65f
-                    path.moveTo(lastJoyX, lastJoyY)
-                    path.quadTo(midX, midY, targetX, targetY)
-                    prevStroke.continueStroke(path, 0L, strokeDuration, true)
-                }
-                activeJoystickStroke = nextStroke
-                lastJoyX = targetX
-                lastJoyY = targetY
-                builder.addStroke(nextStroke)
-                hasAnyStroke = true
-            } else if (activeJoystickStroke != null) {
-                // Cleanly lift virtual thumb
-                val path = Path().apply {
-                    moveTo(lastJoyX, lastJoyY)
-                    lineTo(centerX, centerY)
-                }
-                val endStroke = activeJoystickStroke!!.continueStroke(path, 0L, 40L, false)
-                activeJoystickStroke = null
-                builder.addStroke(endStroke)
-                hasAnyStroke = true
-            }
-
-            // 2. Action Button Tap / Hold (A, B, C, or Menu Continue)
-            if (action.button != ActionButton.NONE) {
-                val (bxNorm, byNorm) = when (action.button) {
-                    ActionButton.A_SHOOT_OR_TACKLE -> config.buttonAX to config.buttonAY
-                    ActionButton.B_LOW_PASS_OR_PRESS -> config.buttonBX to config.buttonBY
-                    ActionButton.C_LOFTED_PASS_OR_SWITCH -> config.buttonCX to config.buttonCY
-                    ActionButton.MENU_CONTINUE -> config.continueBtnX to config.continueBtnY
-                    ActionButton.NONE -> 0f to 0f
-                }
-                val bx = (bxNorm * screenWidth).coerceIn(5f, screenWidth - 5f)
-                val by = (byNorm * screenHeight).coerceIn(5f, screenHeight - 5f)
-                val holdMs = action.buttonHoldMs.coerceIn(45L, 420L)
-
-                val btnPath = Path().apply {
-                    moveTo(bx, by)
-                    lineTo(bx + 1f, by + 1f)
-                }
-                val btnStroke = GestureDescription.StrokeDescription(btnPath, 0L, holdMs, false)
-                builder.addStroke(btnStroke)
-                hasAnyStroke = true
-            }
-
-            if (!hasAnyStroke) {
-                isDispatching.set(false)
-                return
-            }
-
-            val dispatched = dispatchGesture(
+            val ok = dispatchGesture(
                 builder.build(),
                 object : GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) {
-                        isDispatching.set(false)
+                        // Immediately chain the next stroke while virtual thumb remains held down
+                        if (isLoopRunning.get()) {
+                            mainHandler.post { dispatchNextChainedStep() }
+                        }
                     }
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
+                        // Gesture interrupted by user touch or system; reset anchor and continue cleanly
                         activeJoystickStroke = null
-                        isDispatching.set(false)
+                        if (isLoopRunning.get()) {
+                            mainHandler.postDelayed({ dispatchNextChainedStep() }, 40L)
+                        }
                     }
                 },
-                null
+                mainHandler
             )
-            if (!dispatched) {
+            if (!ok) {
                 activeJoystickStroke = null
-                isDispatching.set(false)
+                isLoopRunning.set(false)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Gesture dispatch error: ${e.message}")
+            Log.e(TAG, "Multi-touch dispatchGesture failed: ${e.message}")
             activeJoystickStroke = null
-            isDispatching.set(false)
+            isLoopRunning.set(false)
         }
     }
 
-    fun releaseJoystick() {
-        val stroke = activeJoystickStroke ?: return
+    private fun releaseActiveStrokeAndStopLoop() {
+        val stroke = activeJoystickStroke
         activeJoystickStroke = null
-        try {
-            val path = Path().apply {
-                moveTo(lastJoyX, lastJoyY)
-                lineTo(lastJoyX, lastJoyY)
+        if (stroke != null) {
+            try {
+                val path = Path().apply {
+                    moveTo(lastJoyX, lastJoyY)
+                    lineTo(lastJoyX, lastJoyY)
+                }
+                val endStroke = stroke.continueStroke(path, 0L, 35L, false)
+                dispatchGesture(GestureDescription.Builder().addStroke(endStroke).build(), null, null)
+            } catch (_: Exception) {
+                // Ignore
             }
-            val endStroke = stroke.continueStroke(path, 0L, 30L, false)
-            val gesture = GestureDescription.Builder().addStroke(endStroke).build()
-            dispatchGesture(gesture, null, null)
-        } catch (_: Exception) {
-            // Safe ignore if service already disconnected
         }
+        isLoopRunning.set(false)
     }
 
     companion object {

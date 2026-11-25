@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -20,10 +21,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
-import android.os.Looper
-import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.Log
-import android.view.Gravity
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.dls26.tacticalbot.DlsBotApplication
@@ -31,13 +30,13 @@ import com.dls26.tacticalbot.R
 import com.dls26.tacticalbot.ai.TacticalDecisionEngine
 import com.dls26.tacticalbot.config.BotConfigStore
 import com.dls26.tacticalbot.config.BotRuntimeBus
-import com.dls26.tacticalbot.ui.DebugOverlayView
-import com.dls26.tacticalbot.ui.FloatingControlView
 import com.dls26.tacticalbot.ui.MainActivity
 import com.dls26.tacticalbot.vision.VisionProcessor
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
+import kotlin.math.min
 
 class ScreenCaptureService : Service() {
 
@@ -50,14 +49,11 @@ class ScreenCaptureService : Service() {
 
     private var captureThread: HandlerThread? = null
     private var captureHandler: Handler? = null
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val visionProcessor = VisionProcessor()
     private val decisionEngine = TacticalDecisionEngine()
 
-    private var debugOverlayView: DebugOverlayView? = null
-    private var floatingControlView: FloatingControlView? = null
-
+    // Always normalized to Landscape (screenWidth > screenHeight)
     private var screenWidth: Int = 1920
     private var screenHeight: Int = 1080
     private var screenDensityDpi: Int = 320
@@ -107,11 +103,22 @@ class ScreenCaptureService : Service() {
 
                 startForegroundWithProjectionType()
                 startCapturePipeline(resultCode, resultData)
-                attachOverlaysIfPermitted()
+                startService(Intent(this, FloatingHudService::class.java))
                 BotRuntimeBus.setCaptureRunning(true)
             }
         }
         return START_NOT_STICKY
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Re-sync landscape metrics if device switches from portrait MainActivity into landscape DLS 26
+        val prevW = captureWidth
+        val prevH = captureHeight
+        updateLandscapeDisplayMetrics()
+        if (mediaProjection != null && (prevW != captureWidth || prevH != captureHeight)) {
+            captureHandler?.post { recreateVirtualDisplaySurface() }
+        }
     }
 
     private fun startForegroundWithProjectionType() {
@@ -131,7 +138,7 @@ class ScreenCaptureService : Service() {
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_bot_notification)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Đang quét Minimap & Sa bàn DLS 26...")
+            .setContentText("Đang quét Minimap & Sa bàn DLS 26 (Landscape)...")
             .setOngoing(true)
             .setContentIntent(openAppIntent)
             .addAction(0, "Dừng Bot", stopIntent)
@@ -149,7 +156,7 @@ class ScreenCaptureService : Service() {
     }
 
     private fun startCapturePipeline(resultCode: Int, resultData: Intent) {
-        updateDisplayMetrics()
+        updateLandscapeDisplayMetrics()
 
         captureThread = HandlerThread("DlsCaptureThread").apply { start() }
         captureHandler = Handler(captureThread!!.looper)
@@ -160,19 +167,25 @@ class ScreenCaptureService : Service() {
 
         // Required on Android 14+ (API 34) BEFORE createVirtualDisplay
         projection.registerCallback(projectionCallback, captureHandler)
+        recreateVirtualDisplaySurface()
+    }
+
+    private fun recreateVirtualDisplaySurface() {
+        val projection = mediaProjection ?: return
+        virtualDisplay?.release()
+        imageReader?.close()
 
         imageReader = ImageReader.newInstance(
             captureWidth,
             captureHeight,
             PixelFormat.RGBA_8888,
             2
-        )
-        imageReader?.setOnImageAvailableListener({ reader ->
-            onFrameAvailable(reader)
-        }, captureHandler)
+        ).apply {
+            setOnImageAvailableListener({ reader -> onFrameAvailable(reader) }, captureHandler)
+        }
 
         virtualDisplay = projection.createVirtualDisplay(
-            "DLS26_Bot_Display",
+            "DLS26_Bot_Landscape_Display",
             captureWidth,
             captureHeight,
             screenDensityDpi,
@@ -194,7 +207,6 @@ class ScreenCaptureService : Service() {
         val config = BotRuntimeBus.config.value
         val frameIntervalMs = (1000L / config.targetFps.coerceIn(10, 24))
 
-        // Frame skipping for 15-20 FPS target & zero backlog
         if (!DlsBotApplication.isOpenCvLoaded ||
             (nowMs - lastProcessedMs) < frameIntervalMs ||
             !isProcessingFrame.compareAndSet(false, true)
@@ -206,7 +218,7 @@ class ScreenCaptureService : Service() {
         try {
             lastProcessedMs = nowMs
             val rgbaMat = imageToRgbaMat(image)
-            // Always close image immediately after copying bytes into Mat to prevent BufferQueue exhaustion
+            // Immediately free Image buffer after copying to OpenCV Mat
             image.close()
 
             val gameState = visionProcessor.processFrame(
@@ -222,7 +234,7 @@ class ScreenCaptureService : Service() {
             BotRuntimeBus.publishFrame(gameState, action)
 
             if (botActive) {
-                AutoTouchAccessibilityService.instance?.executeAction(
+                AutoTouchAccessibilityService.instance?.submitAction(
                     action = action,
                     config = config,
                     screenWidth = screenWidth,
@@ -230,14 +242,10 @@ class ScreenCaptureService : Service() {
                     frameIntervalMs = frameIntervalMs
                 )
             } else {
-                AutoTouchAccessibilityService.instance?.releaseJoystick()
+                AutoTouchAccessibilityService.instance?.stopAndReleaseJoystick()
             }
 
-            if (config.debugOverlayEnabled) {
-                mainHandler.post {
-                    debugOverlayView?.updateDebugData(gameState, action, config, botActive)
-                }
-            }
+            FloatingHudService.instance?.updateDebugFrame(gameState, action, config, botActive)
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}")
             runCatching { image.close() }
@@ -273,10 +281,10 @@ class ScreenCaptureService : Service() {
             val rowTemp = ByteArray(rowStride)
             var dstOffset = 0
             for (row in 0 until height) {
-                val bytesToRead = minOf(rowStride, buffer.remaining())
+                val bytesToRead = min(rowStride, buffer.remaining())
                 if (bytesToRead <= 0) break
                 buffer.get(rowTemp, 0, bytesToRead)
-                System.arraycopy(rowTemp, 0, reusableRowBuffer, dstOffset, minOf(rowLen, bytesToRead))
+                System.arraycopy(rowTemp, 0, reusableRowBuffer, dstOffset, min(rowLen, bytesToRead))
                 dstOffset += rowLen
             }
         }
@@ -285,107 +293,35 @@ class ScreenCaptureService : Service() {
         return mat
     }
 
-    private fun updateDisplayMetrics() {
-        val dm = resources.displayMetrics
-        screenDensityDpi = dm.densityDpi
+    /**
+     * Reads real physical screen dimensions (currentWindowMetrics on Android 11+, getRealMetrics on older)
+     * and enforces Landscape orientation (screenWidth > screenHeight) for DLS 26.
+     */
+    private fun updateLandscapeDisplayMetrics() {
+        val dm = DisplayMetrics()
+        val rawW: Int
+        val rawH: Int
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = windowManager.currentWindowMetrics.bounds
-            screenWidth = bounds.width()
-            screenHeight = bounds.height()
+            rawW = bounds.width()
+            rawH = bounds.height()
+            screenDensityDpi = resources.displayMetrics.densityDpi
         } else {
-            screenWidth = dm.widthPixels
-            screenHeight = dm.heightPixels
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            rawW = dm.widthPixels
+            rawH = dm.heightPixels
+            screenDensityDpi = dm.densityDpi
         }
 
-        // Downscale to <= 960px on long edge to keep OpenCV processing < 25ms/frame
-        val scale = if (maxOf(screenWidth, screenHeight) > 960) {
-            960f / maxOf(screenWidth, screenHeight).toFloat()
-        } else {
-            1f
-        }
+        screenWidth = max(rawW, rawH)
+        screenHeight = min(rawW, rawH)
+
+        // Downscale to <= 960px wide while keeping exact landscape aspect ratio for < 25ms OpenCV frame latency
+        val scale = if (screenWidth > 960) 960f / screenWidth.toFloat() else 1f
         captureWidth = ((screenWidth * scale).toInt() / 2) * 2
         captureHeight = ((screenHeight * scale).toInt() / 2) * 2
-    }
-
-    private fun attachOverlaysIfPermitted() {
-        if (!Settings.canDrawOverlays(this)) return
-
-        mainHandler.post {
-            if (debugOverlayView == null) {
-                val overlay = DebugOverlayView(this)
-                val params = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                    PixelFormat.TRANSLUCENT
-                )
-                windowManager.addView(overlay, params)
-                debugOverlayView = overlay
-                overlay.visibility = if (BotRuntimeBus.config.value.debugOverlayEnabled) {
-                    android.view.View.VISIBLE
-                } else {
-                    android.view.View.GONE
-                }
-            }
-
-            if (floatingControlView == null) {
-                val pillParams = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                    PixelFormat.TRANSLUCENT
-                ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    x = 24
-                    y = 80
-                }
-
-                val pill = FloatingControlView(
-                    context = this,
-                    onTogglePlay = {
-                        val nextActive = !BotRuntimeBus.snapshot.value.isBotActive
-                        BotRuntimeBus.setBotActive(nextActive)
-                        if (!nextActive) {
-                            AutoTouchAccessibilityService.instance?.releaseJoystick()
-                            decisionEngine.resetTracking()
-                        }
-                    },
-                    onToggleDebug = {
-                        val current = BotRuntimeBus.config.value
-                        val updated = current.copy(debugOverlayEnabled = !current.debugOverlayEnabled)
-                        configStore.save(updated)
-                        BotRuntimeBus.updateConfig(updated)
-                        debugOverlayView?.visibility = if (updated.debugOverlayEnabled) {
-                            android.view.View.VISIBLE
-                        } else {
-                            android.view.View.GONE
-                        }
-                    },
-                    onStopService = { stopSelf() },
-                    onDragBy = { dx, dy ->
-                        pillParams.x += dx
-                        pillParams.y += dy
-                        runCatching { windowManager.updateViewLayout(floatingControlView, pillParams) }
-                    }
-                )
-                windowManager.addView(pill, pillParams)
-                floatingControlView = pill
-            }
-        }
-    }
-
-    private fun detachOverlays() {
-        mainHandler.post {
-            debugOverlayView?.let { runCatching { windowManager.removeView(it) } }
-            debugOverlayView = null
-            floatingControlView?.let { runCatching { windowManager.removeView(it) } }
-            floatingControlView = null
-        }
     }
 
     private fun createNotificationChannel() {
@@ -400,8 +336,8 @@ class ScreenCaptureService : Service() {
 
     override fun onDestroy() {
         BotRuntimeBus.setCaptureRunning(false)
-        AutoTouchAccessibilityService.instance?.releaseJoystick()
-        detachOverlays()
+        AutoTouchAccessibilityService.instance?.stopAndReleaseJoystick()
+        stopService(Intent(this, FloatingHudService::class.java))
 
         virtualDisplay?.release()
         virtualDisplay = null
