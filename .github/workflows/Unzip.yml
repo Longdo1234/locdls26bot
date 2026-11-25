@@ -9,11 +9,12 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Extract and flatten folder
+      - name: Extract project without workflows
         run: |
-          unzip -o DLS26-Tactical-AutoBot.zip
+          unzip -o "*.zip"
+          rm -rf DLS26-Tactical-AutoBot/.github
           cp -r DLS26-Tactical-AutoBot/. .
-          rm -rf DLS26-Tactical-AutoBot DLS26-Tactical-AutoBot.zip .github/workflows/unzip.yml
+          rm -rf DLS26-Tactical-AutoBot *.zip .github/workflows/unzip.yml
       - name: Push extracted files
         run: |
           git config user.name "github-actions"
