@@ -29,7 +29,7 @@ import com.dls26.tacticalbot.DlsBotApplication
 import com.dls26.tacticalbot.R
 import com.dls26.tacticalbot.ai.TacticalDecisionEngine
 import com.dls26.tacticalbot.config.BotConfigStore
-import com.dls26.tacticalbot.config.BotRuntimeBus
+import com.dls26.tacticalbot.config.BotRuntimeState
 import com.dls26.tacticalbot.ui.MainActivity
 import com.dls26.tacticalbot.vision.VisionProcessor
 import org.opencv.core.CvType
@@ -76,7 +76,7 @@ class ScreenCaptureService : Service() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         configStore = BotConfigStore(this)
-        BotRuntimeBus.updateConfig(configStore.load())
+        BotRuntimeState.updateConfig(configStore.load())
         createNotificationChannel()
     }
 
@@ -104,7 +104,7 @@ class ScreenCaptureService : Service() {
                 startForegroundWithProjectionType()
                 startCapturePipeline(resultCode, resultData)
                 startService(Intent(this, FloatingHudService::class.java))
-                BotRuntimeBus.setCaptureRunning(true)
+                BotRuntimeState.setCaptureRunning(true)
             }
         }
         return START_NOT_STICKY
@@ -204,7 +204,7 @@ class ScreenCaptureService : Service() {
         }
 
         val nowMs = System.currentTimeMillis()
-        val config = BotRuntimeBus.config.value
+        val config = BotRuntimeState.config.value
         val frameIntervalMs = (1000L / config.targetFps.coerceIn(10, 24))
 
         if (!DlsBotApplication.isOpenCvLoaded ||
@@ -229,20 +229,22 @@ class ScreenCaptureService : Service() {
                 nowMs = nowMs
             )
 
-            val botActive = BotRuntimeBus.snapshot.value.isBotActive
+            val botActive = BotRuntimeState.isBotRunning.get()
+            val settingsOpen = BotRuntimeState.isSettingsOpen.get()
             val action = decisionEngine.decide(gameState, config)
-            BotRuntimeBus.publishFrame(gameState, action)
+            BotRuntimeState.publishFrame(gameState, action)
 
-            if (botActive) {
+            if (BotRuntimeState.canDispatchGesture(gameState.isValidMinimap)) {
                 AutoTouchAccessibilityService.instance?.submitAction(
                     action = action,
                     config = config,
+                    isValidMinimap = gameState.isValidMinimap,
                     screenWidth = screenWidth,
                     screenHeight = screenHeight,
                     frameIntervalMs = frameIntervalMs
                 )
             } else {
-                AutoTouchAccessibilityService.instance?.stopAndReleaseJoystick()
+                AutoTouchAccessibilityService.instance?.hardStopAndClear()
             }
 
             FloatingHudService.instance?.updateDebugFrame(gameState, action, config, botActive)
@@ -335,8 +337,8 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        BotRuntimeBus.setCaptureRunning(false)
-        AutoTouchAccessibilityService.instance?.stopAndReleaseJoystick()
+        BotRuntimeState.setCaptureRunning(false)
+        AutoTouchAccessibilityService.instance?.hardStopAndClear()
         stopService(Intent(this, FloatingHudService::class.java))
 
         virtualDisplay?.release()

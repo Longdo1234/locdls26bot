@@ -15,6 +15,8 @@ data class ScreenPoint(
 )
 
 data class MinimapDetection(
+    val isValidMinimap: Boolean,
+    val grassRatio: Float,
     val allies: List<NormalizedPoint>,
     val opponents: List<NormalizedPoint>,
     val ball: NormalizedPoint?,
@@ -32,6 +34,7 @@ data class MinimapDetection(
 
 data class GameState(
     val timestampMs: Long,
+    val isValidMinimap: Boolean,
     val scene: GameScene,
     val possession: PossessionState,
     val minimap: MinimapDetection,

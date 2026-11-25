@@ -42,6 +42,20 @@ class TacticalDecisionEngine {
     fun decide(state: GameState, config: BotConfig): BotAction {
         val now = state.timestampMs
 
+        // Hard Gate: Never guess or issue joystick/button actions if Minimap ROI is not valid (<25% grass)
+        if (!state.isValidMinimap) {
+            resetTracking()
+            return BotAction(
+                state = TacticalState.IDLE,
+                joystickActive = false,
+                joystickAngleRad = 0f,
+                joystickMagnitude = 0f,
+                button = ActionButton.NONE,
+                buttonHoldMs = 0L,
+                debugNote = "No Minimap (Grass ${(state.minimap.grassRatio * 100).toInt()}%)"
+            )
+        }
+
         // 1. Menu / Post-match Auto-Farm handling
         if (state.scene == GameScene.MENU_OR_POST_MATCH) {
             resetTracking()

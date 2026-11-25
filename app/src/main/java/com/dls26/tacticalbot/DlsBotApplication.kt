@@ -2,12 +2,14 @@ package com.dls26.tacticalbot
 
 import android.app.Application
 import android.util.Log
+import com.dls26.tacticalbot.config.BotRuntimeState
 import org.opencv.android.OpenCVLoader
 
 class DlsBotApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        BotRuntimeState.forceStopAll()
         isOpenCvLoaded = OpenCVLoader.initLocal()
         if (isOpenCvLoaded) {
             Log.i(TAG, "OpenCV 4.9.0 native libraries loaded successfully.")

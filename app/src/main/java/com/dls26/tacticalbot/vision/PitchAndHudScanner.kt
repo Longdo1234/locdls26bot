@@ -31,74 +31,33 @@ class PitchAndHudScanner {
         val frameW = rgbaFrame.cols()
         val frameH = rgbaFrame.rows()
 
-        val hasActionCluster = detectActionButtonsHud(rgbaFrame, config, frameW, frameH)
-        val hasContinueBtn = detectContinueButton(rgbaFrame, config, frameW, frameH)
-
-        // Scene Classification
-        val inMatchSignal = minimap.minimapConfidence >= 0.34f ||
-            (minimap.allies.size + minimap.opponents.size >= 5 && hasActionCluster)
-
-        val scene = if (inMatchSignal) {
-            val ball = minimap.ball
-            val ballSpeed = hypot(minimap.ballVx, minimap.ballVy)
-            val nearBoundary = ball != null && (abs(ball.y) > 0.89f || abs(ball.x) > 0.86f)
-            if (nearBoundary && ballSpeed < 0.035f) {
-                stationarySetPieceFrames++
-            } else {
-                stationarySetPieceFrames = 0
-            }
-            if (stationarySetPieceFrames >= 8) GameScene.SET_PIECE else GameScene.IN_MATCH
-        } else {
+        if (!minimap.isValidMinimap) {
             stationarySetPieceFrames = 0
-            if (hasContinueBtn || minimap.minimapConfidence < 0.18f) {
-                GameScene.MENU_OR_POST_MATCH
-            } else {
-                GameScene.UNKNOWN
-            }
+            val hasContinue = detectContinueButton(rgbaFrame, config, frameW, frameH)
+            return PitchHudScanResult(
+                scene = if (hasContinue) GameScene.MENU_OR_POST_MATCH else GameScene.UNKNOWN,
+                possession = PossessionState.LOOSE_BALL,
+                hasContinueButton = hasContinue
+            )
         }
 
-        // Possession Detection (Minimap distance + Main Pitch active player ring)
+        val ball = minimap.ball
+        val ballSpeed = hypot(minimap.ballVx, minimap.ballVy)
+        val nearBoundary = ball != null && (abs(ball.y) > 0.89f || abs(ball.x) > 0.86f)
+        if (nearBoundary && ballSpeed < 0.035f) {
+            stationarySetPieceFrames++
+        } else {
+            stationarySetPieceFrames = 0
+        }
+
+        val scene = if (stationarySetPieceFrames >= 8) GameScene.SET_PIECE else GameScene.IN_MATCH
         val possession = detectPossession(rgbaFrame, minimap, frameW, frameH)
 
         return PitchHudScanResult(
             scene = scene,
             possession = possession,
-            hasContinueButton = hasContinueBtn
+            hasContinueButton = false
         )
-    }
-
-    private fun detectActionButtonsHud(
-        rgbaFrame: Mat,
-        config: BotConfig,
-        frameW: Int,
-        frameH: Int
-    ): Boolean {
-        val left = ((minOf(config.buttonAX, config.buttonBX, config.buttonCX) - 0.05f) * frameW)
-            .toInt().coerceIn(0, max(0, frameW - 4))
-        val top = ((minOf(config.buttonAY, config.buttonBY, config.buttonCY) - 0.06f) * frameH)
-            .toInt().coerceIn(0, max(0, frameH - 4))
-        val right = ((maxOf(config.buttonAX, config.buttonBX, config.buttonCX) + 0.05f) * frameW)
-            .toInt().coerceIn(left + 2, frameW)
-        val bottom = ((maxOf(config.buttonAY, config.buttonBY, config.buttonCY) + 0.06f) * frameH)
-            .toInt().coerceIn(top + 2, frameH)
-
-        val roi = Mat(rgbaFrame, Rect(left, top, right - left, bottom - top))
-        val bgr = Mat()
-        val hsv = Mat()
-        val brightMask = Mat()
-        return try {
-            Imgproc.cvtColor(roi, bgr, Imgproc.COLOR_RGBA2BGR)
-            Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV)
-            // Translucent white/gray circular button outlines on lower-right HUD
-            Core.inRange(hsv, Scalar(0.0, 0.0, 175.0), Scalar(180.0, 90.0, 255.0), brightMask)
-            val ratio = Core.countNonZero(brightMask).toFloat() / ((right - left) * (bottom - top)).toFloat()
-            ratio in 0.025f..0.48f
-        } finally {
-            brightMask.release()
-            hsv.release()
-            bgr.release()
-            roi.release()
-        }
     }
 
     private fun detectContinueButton(
@@ -125,7 +84,6 @@ class PitchAndHudScanner {
         return try {
             Imgproc.cvtColor(roi, bgr, Imgproc.COLOR_RGBA2BGR)
             Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV)
-            // DLS 26 Continue / Next / Play CTA buttons are vivid saturated green/cyan/gold pills
             Core.inRange(hsv, Scalar(18.0, 110.0, 130.0), Scalar(125.0, 255.0, 255.0), ctaMask)
             val ratio = Core.countNonZero(ctaMask).toFloat() / (width * height).toFloat()
             ratio >= 0.28f
@@ -155,7 +113,6 @@ class PitchAndHudScanner {
             return PossessionState.OPPONENT
         }
 
-        // Tie-breaker using main pitch active-player ring indicator near center camera area
         val hasAllyRingOnPitch = detectCenterPitchSelectionRing(rgbaFrame, frameW, frameH)
         return when {
             nearestAllyDist < 0.14f && hasAllyRingOnPitch -> PossessionState.ALLY
@@ -170,7 +127,6 @@ class PitchAndHudScanner {
         frameW: Int,
         frameH: Int
     ): Boolean {
-        // Main pitch camera keeps the ball & active player inside central 25%..75% X, 22%..68% Y
         val left = (frameW * 0.28f).toInt().coerceIn(0, max(0, frameW - 4))
         val top = (frameH * 0.24f).toInt().coerceIn(0, max(0, frameH - 4))
         val width = (frameW * 0.44f).toInt().coerceAtMost(frameW - left)
@@ -184,7 +140,6 @@ class PitchAndHudScanner {
         return try {
             Imgproc.cvtColor(roi, bgr, Imgproc.COLOR_RGBA2BGR)
             Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV)
-            // Bright cyan/electric-blue underfoot ring indicator in DLS 26
             Core.inRange(hsv, Scalar(85.0, 140.0, 170.0), Scalar(115.0, 255.0, 255.0), ringMask)
             val ratio = Core.countNonZero(ringMask).toFloat() / (width * height).toFloat()
             ratio in 0.0008f..0.045f

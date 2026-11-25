@@ -45,6 +45,7 @@ class VisionProcessor {
 
         return GameState(
             timestampMs = nowMs,
+            isValidMinimap = minimap.isValidMinimap,
             scene = hudResult.scene,
             possession = hudResult.possession,
             minimap = minimap,

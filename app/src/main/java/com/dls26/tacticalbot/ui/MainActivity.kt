@@ -22,7 +22,7 @@ import com.dls26.tacticalbot.DlsBotApplication
 import com.dls26.tacticalbot.R
 import com.dls26.tacticalbot.config.BotConfig
 import com.dls26.tacticalbot.config.BotConfigStore
-import com.dls26.tacticalbot.config.BotRuntimeBus
+import com.dls26.tacticalbot.config.BotRuntimeState
 import com.dls26.tacticalbot.databinding.ActivityMainBinding
 import com.dls26.tacticalbot.model.AttackDirection
 import com.dls26.tacticalbot.model.TacticalMode
@@ -69,7 +69,7 @@ class MainActivity : AppCompatActivity() {
 
         configStore = BotConfigStore(this)
         currentConfig = configStore.load()
-        BotRuntimeBus.updateConfig(currentConfig)
+        BotRuntimeState.updateConfig(currentConfig)
 
         setupOpenCvBanner()
         setupPermissionButtons()
@@ -184,7 +184,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupLaunchButton() {
         binding.btnStartStopBot.setOnClickListener {
-            if (BotRuntimeBus.snapshot.value.isCaptureRunning) {
+            if (BotRuntimeState.isCaptureRunning.get()) {
                 val stopIntent = Intent(this, ScreenCaptureService::class.java)
                     .setAction(ScreenCaptureService.ACTION_STOP)
                 startService(stopIntent)
@@ -216,7 +216,7 @@ class MainActivity : AppCompatActivity() {
     private fun persistConfig(updated: BotConfig) {
         currentConfig = updated
         configStore.save(updated)
-        BotRuntimeBus.updateConfig(updated)
+        BotRuntimeState.updateConfig(updated)
     }
 
     private fun refreshPermissionBadges() {
@@ -238,7 +238,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateRuntimeUi() {
-        val running = BotRuntimeBus.snapshot.value.isCaptureRunning
+        val running = BotRuntimeState.isCaptureRunning.get()
         if (running) {
             binding.btnStartStopBot.text = "DỪNG BOT & TẮT QUÉT MÀN HÌNH"
             binding.btnStartStopBot.setBackgroundColor(ContextCompat.getColor(this, R.color.accent_red))

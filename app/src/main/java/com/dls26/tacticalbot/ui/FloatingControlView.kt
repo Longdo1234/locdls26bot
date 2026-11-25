@@ -8,6 +8,7 @@ import android.view.MotionEvent
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.dls26.tacticalbot.R
+import com.dls26.tacticalbot.config.BotRuntimeState
 import kotlin.math.abs
 
 @SuppressLint("ViewConstructor")
@@ -19,7 +20,6 @@ class FloatingControlView(
     private val onDragBy: (dx: Int, dy: Int) -> Unit
 ) : LinearLayout(context) {
 
-    private var isPlaying = false
     private val playButton: TextView
     private val settingsButton: TextView
     private val stopButton: TextView
@@ -46,9 +46,8 @@ class FloatingControlView(
         stopButton = createChip("✕", "#EF4444")
 
         playButton.setOnClickListener {
-            isPlaying = !isPlaying
-            updatePlayVisual(isPlaying)
             onTogglePlay()
+            syncVisualFromState()
         }
 
         settingsButton.setOnClickListener { onOpenSettings() }
@@ -60,13 +59,14 @@ class FloatingControlView(
         addView(stopButton)
 
         dragHandle.setOnTouchListener { _, event -> handleDrag(event) }
+        syncVisualFromState()
     }
 
-    fun updatePlayVisual(playing: Boolean) {
-        isPlaying = playing
-        playButton.text = if (isPlaying) "⏸ PAUSE" else "▶ RUN"
+    fun syncVisualFromState() {
+        val running = BotRuntimeState.isBotRunning.get()
+        playButton.text = if (running) "⏸ PAUSE" else "▶ RUN"
         playButton.setTextColor(
-            if (isPlaying) Color.parseColor("#F59E0B") else Color.parseColor("#10B981")
+            if (running) Color.parseColor("#F59E0B") else Color.parseColor("#10B981")
         )
     }
 

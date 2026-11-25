@@ -161,7 +161,7 @@ class DebugOverlayView(context: Context) : View(context) {
         val joyR = cfg.joystickRadiusNorm * min(w, h)
         canvas.drawCircle(joyX, joyY, joyR, controlPaint)
 
-        if (action != null && action.joystickActive) {
+        if (isBotActive && action != null && action.joystickActive) {
             val endX = joyX + cos(action.joystickAngleRad) * joyR * action.joystickMagnitude
             val endY = joyY + sin(action.joystickAngleRad) * joyR * action.joystickMagnitude
             canvas.drawLine(joyX, joyY, endX, endY, vectorPaint)
@@ -177,7 +177,7 @@ class DebugOverlayView(context: Context) : View(context) {
         }
 
         // 5. Top Tactical HUD Banner
-        val statusStr = if (isBotActive) "BOT ON" else "PAUSED"
+        val statusStr = if (isBotActive) "BOT ON" else "PAUSED (NHẤN RUN)"
         val aiState = action?.state?.name ?: "IDLE"
         val sceneStr = state?.scene?.name ?: "WAIT"
         val possStr = state?.possession?.name ?: "-"

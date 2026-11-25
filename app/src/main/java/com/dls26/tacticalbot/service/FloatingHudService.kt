@@ -13,7 +13,7 @@ import android.view.View
 import android.view.WindowManager
 import com.dls26.tacticalbot.config.BotConfig
 import com.dls26.tacticalbot.config.BotConfigStore
-import com.dls26.tacticalbot.config.BotRuntimeBus
+import com.dls26.tacticalbot.config.BotRuntimeState
 import com.dls26.tacticalbot.model.BotAction
 import com.dls26.tacticalbot.model.GameState
 import com.dls26.tacticalbot.ui.DebugOverlayView
@@ -21,12 +21,6 @@ import com.dls26.tacticalbot.ui.FloatingControlView
 import com.dls26.tacticalbot.ui.InHudSettingsOverlay
 import com.dls26.tacticalbot.ui.RoiCalibrationOverlay
 
-/**
- * Manages all floating windows in DLS 26:
- * - DebugOverlayView (FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE so dispatchGesture is never blocked)
- * - FloatingControlView (compact pill with Play/Pause, ⚙️ Settings, Stop)
- * - InHudSettingsOverlay (in-game draggable quick settings + Anchor Drag Calibration)
- */
 class FloatingHudService : Service() {
 
     private lateinit var windowManager: WindowManager
@@ -42,7 +36,17 @@ class FloatingHudService : Service() {
         instance = this
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         configStore = BotConfigStore(this)
-        BotRuntimeBus.updateConfig(configStore.load())
+        BotRuntimeState.updateConfig(configStore.load())
+        BotRuntimeState.setBotRunning(false)
+        BotRuntimeState.setSettingsOpen(false)
+        BotRuntimeState.setOnBotRunningChangedListener { running ->
+            mainHandler.post {
+                floatingControlView?.syncVisualFromState()
+                if (!running) {
+                    AutoTouchAccessibilityService.instance?.hardStopAndClear()
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -50,6 +54,7 @@ class FloatingHudService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        BotRuntimeState.setBotRunning(false)
         if (Settings.canDrawOverlays(this)) {
             mainHandler.post {
                 attachDebugOverlay()
@@ -83,7 +88,7 @@ class FloatingHudService : Service() {
             PixelFormat.TRANSLUCENT
         )
         windowManager.addView(overlay, params)
-        overlay.visibility = if (BotRuntimeBus.config.value.debugOverlayEnabled) View.VISIBLE else View.GONE
+        overlay.visibility = if (BotRuntimeState.config.value.debugOverlayEnabled) View.VISIBLE else View.GONE
         debugOverlayView = overlay
     }
 
@@ -104,14 +109,16 @@ class FloatingHudService : Service() {
         val pill = FloatingControlView(
             context = this,
             onTogglePlay = {
-                val nextActive = !BotRuntimeBus.snapshot.value.isBotActive
-                BotRuntimeBus.setBotActive(nextActive)
-                if (!nextActive) {
-                    AutoTouchAccessibilityService.instance?.stopAndReleaseJoystick()
+                val nextRunning = !BotRuntimeState.isBotRunning.get()
+                BotRuntimeState.setBotRunning(nextRunning)
+                if (!nextRunning) {
+                    AutoTouchAccessibilityService.instance?.hardStopAndClear()
                 }
             },
             onOpenSettings = { toggleInHudSettings() },
             onStopService = {
+                BotRuntimeState.forceStopAll()
+                AutoTouchAccessibilityService.instance?.hardStopAndClear()
                 stopService(Intent(this, ScreenCaptureService::class.java))
                 stopSelf()
             },
@@ -131,6 +138,9 @@ class FloatingHudService : Service() {
             return
         }
 
+        BotRuntimeState.setSettingsOpen(true)
+        AutoTouchAccessibilityService.instance?.hardStopAndClear()
+
         val panelParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -145,20 +155,26 @@ class FloatingHudService : Service() {
 
         val panel = InHudSettingsOverlay(
             context = this,
-            initialConfig = BotRuntimeBus.config.value,
+            initialConfig = BotRuntimeState.config.value,
             onConfigChanged = { updated ->
                 configStore.save(updated)
-                BotRuntimeBus.updateConfig(updated)
+                BotRuntimeState.updateConfig(updated)
                 debugOverlayView?.visibility = if (updated.debugOverlayEnabled) View.VISIBLE else View.GONE
             },
             onOpenAnchorCalibration = {
+                BotRuntimeState.setSettingsOpen(true)
+                AutoTouchAccessibilityService.instance?.hardStopAndClear()
                 RoiCalibrationOverlay.show(
                     context = this,
                     windowManager = windowManager,
-                    initialConfig = BotRuntimeBus.config.value,
+                    initialConfig = BotRuntimeState.config.value,
                     onSaved = { calibrated ->
                         configStore.save(calibrated)
-                        BotRuntimeBus.updateConfig(calibrated)
+                        BotRuntimeState.updateConfig(calibrated)
+                        BotRuntimeState.setSettingsOpen(false)
+                    },
+                    onDismissed = {
+                        BotRuntimeState.setSettingsOpen(false)
                     }
                 )
             },
@@ -176,9 +192,13 @@ class FloatingHudService : Service() {
     private fun closeInHudSettings() {
         settingsOverlayView?.let { runCatching { windowManager.removeView(it) } }
         settingsOverlayView = null
+        BotRuntimeState.setSettingsOpen(false)
     }
 
     override fun onDestroy() {
+        BotRuntimeState.setOnBotRunningChangedListener(null)
+        BotRuntimeState.forceStopAll()
+        AutoTouchAccessibilityService.instance?.hardStopAndClear()
         mainHandler.post {
             closeInHudSettings()
             debugOverlayView?.let { runCatching { windowManager.removeView(it) } }

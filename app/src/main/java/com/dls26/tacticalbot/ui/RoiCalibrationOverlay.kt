@@ -225,7 +225,8 @@ class RoiCalibrationOverlay(
             context: Context,
             windowManager: WindowManager,
             initialConfig: BotConfig,
-            onSaved: (BotConfig) -> Unit
+            onSaved: (BotConfig) -> Unit,
+            onDismissed: () -> Unit = {}
         ): RoiCalibrationOverlay {
             var overlayRef: RoiCalibrationOverlay? = null
             val overlay = RoiCalibrationOverlay(
@@ -236,6 +237,7 @@ class RoiCalibrationOverlay(
                     overlayRef?.let { runCatching { windowManager.removeView(it) } }
                 },
                 onCancel = {
+                    onDismissed()
                     overlayRef?.let { runCatching { windowManager.removeView(it) } }
                 }
             )
