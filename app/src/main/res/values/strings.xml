@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DLS26 Tactical AutoBot</string>
+    <string name="accessibility_service_label">DLS26 Tactical AutoBot Touch</string>
+    <string name="accessibility_service_description">Thực hiện thao tác kéo joystick và bấm nút A/B/C tự động cho Dream League Soccer 2026 mà không cần Root.</string>
+    <string name="notification_channel_name">DLS26 Bot Capture Service</string>
+</resources>
