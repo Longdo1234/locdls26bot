@@ -9,6 +9,7 @@ import com.dls26.tacticalbot.model.NormalizedPoint
 import com.dls26.tacticalbot.model.PossessionState
 import com.dls26.tacticalbot.model.TacticalMode
 import com.dls26.tacticalbot.model.TacticalState
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -16,21 +17,30 @@ import kotlin.math.hypot
 import kotlin.math.sin
 
 /**
- * Tactical FSM aligned with standard DLS 26 controls:
- * - A: Shoot (Attack) / Slide Tackle (Defend)
- * - B: Low Pass (Attack) / Press (Defend)
- * - C: Lofted Pass & Cross (Attack) / Switch Player (Defend)
+ * High-Discipline Tactical FSM for DLS 26:
+ * - PRIORITY #1 (ATTACK): Shooting with Button A immediately inside Shoot Zone (X >= 0.55, |Y| <= 0.60).
+ *     Close (X >= 0.75) -> hold A 180ms; Mid (0.55 <= X < 0.75) -> hold A 280ms; shootCooldown = 900ms.
+ * - PRIORITY #2 (ATTACK): Default Straight Dribble toward opponent goal (+1.0, 0.0) whenever forward
+ *     ±35 deg cone is clear (nearestFrontOppDist > 0.18).
+ * - PRIORITY #3 (ATTACK): Purposeful Passing ONLY when ALL 3 conditions hold:
+ *     1) Front opponent <= 0.18 OR trapped on sideline (|Y| > 0.85)
+ *     2) Valid forward teammate (ally.x > player.x - 0.05, dist 0.15..0.75, lane clearance > 0.08)
+ *     3) passCooldown = 1100ms + 80ms pre-aim joystick windup before B (90ms) or wing cross C (180ms).
+ *     If no safe pass exists -> evade ±45 deg toward open flank instead of passing blindly.
  */
 class TacticalDecisionEngine {
 
-    // Cooldowns (ms) to prevent AccessibilityService overlapping gesture spam
     private var lastPassMs: Long = 0L
     private var lastShootMs: Long = 0L
     private var lastSwitchMs: Long = 0L
     private var lastTackleMs: Long = 0L
-    private var lastMenuClickMs: Long = 0L
+    private var lastPressMs: Long = 0L
 
-    // Circular EMA state for smooth joystick direction
+    // 80ms pre-aim windup tracker before pressing B/C
+    private var pendingPassStartMs: Long = 0L
+    private var pendingPassTarget: NormalizedPoint? = null
+
+    // Circular EMA smoothing for steady joystick direction
     private var hasEma: Boolean = false
     private var emaCos: Float = 1f
     private var emaSin: Float = 0f
@@ -42,7 +52,6 @@ class TacticalDecisionEngine {
     fun decide(state: GameState, config: BotConfig): BotAction {
         val now = state.timestampMs
 
-        // Hard Gate: Never guess or issue joystick/button actions if Minimap ROI is not valid (<25% grass)
         if (!state.isValidMinimap) {
             resetTracking()
             return BotAction(
@@ -56,37 +65,14 @@ class TacticalDecisionEngine {
             )
         }
 
-        // 1. Menu / Post-match Auto-Farm handling
-        if (state.scene == GameScene.MENU_OR_POST_MATCH) {
+        if (state.scene == GameScene.MENU_OR_POST_MATCH || state.scene == GameScene.UNKNOWN) {
             resetTracking()
-            if (config.autoFarmSkipMenus && state.hasContinueButton && now - lastMenuClickMs >= MENU_COOLDOWN_MS) {
-                lastMenuClickMs = now
-                return BotAction(
-                    state = TacticalState.MENU_AUTO_ADVANCE,
-                    joystickActive = false,
-                    joystickAngleRad = 0f,
-                    joystickMagnitude = 0f,
-                    button = ActionButton.MENU_CONTINUE,
-                    buttonHoldMs = 80L,
-                    debugNote = "Auto-Continue"
-                )
-            }
             return BotAction(
                 state = TacticalState.IDLE,
                 joystickActive = false,
                 joystickAngleRad = 0f,
                 joystickMagnitude = 0f,
-                debugNote = "Menu Idle"
-            )
-        }
-
-        if (state.scene == GameScene.UNKNOWN) {
-            return BotAction(
-                state = TacticalState.IDLE,
-                joystickActive = false,
-                joystickAngleRad = 0f,
-                joystickMagnitude = 0f,
-                debugNote = "Scanning..."
+                debugNote = "Standby"
             )
         }
 
@@ -94,17 +80,18 @@ class TacticalDecisionEngine {
         val active = mm.activePlayer
         val ball = mm.ball
 
-        // 2. Set Piece (Throw-in, Corner, Goal Kick) -> Safe quick low pass (B)
+        // Set Piece (Throw-in / Corner / Goal Kick) -> Safe quick low pass B
         if (state.scene == GameScene.SET_PIECE) {
+            clearPendingPass()
             val origin = active ?: ball ?: NormalizedPoint(0f, 0f)
-            val bestMate = findBestPassTarget(origin, mm.allies, mm.opponents, config.tacticalMode)
+            val bestMate = findBestSafePassTarget(origin, mm.allies, mm.opponents)
             val targetAnglePitch = if (bestMate != null) {
                 atan2(bestMate.y - origin.y, bestMate.x - origin.x)
             } else {
                 atan2(-origin.y * 0.5f, 1f - origin.x)
             }
             val screenAngle = smoothScreenAngle(pitchToScreenAngle(targetAnglePitch, mm.attackingRight))
-            val btn = if (now - lastPassMs >= 650L) {
+            val btn = if (now - lastPassMs >= PASS_COOLDOWN_MS) {
                 lastPassMs = now
                 ActionButton.B_LOW_PASS_OR_PRESS
             } else {
@@ -114,24 +101,25 @@ class TacticalDecisionEngine {
                 state = TacticalState.SET_PIECE_PASS,
                 joystickActive = true,
                 joystickAngleRad = screenAngle,
-                joystickMagnitude = 0.85f,
+                joystickMagnitude = 1.0f,
                 button = btn,
-                buttonHoldMs = if (btn != ActionButton.NONE) 140L else 0L,
-                debugNote = "Set Piece Pass B"
+                buttonHoldMs = if (btn != ActionButton.NONE) 90L else 0L,
+                debugNote = "Set Piece B"
             )
         }
 
-        // 3. Anti-Stuck Watchdog during IN_MATCH
+        // Anti-stuck watchdog during IN_MATCH
         val referencePos = ball ?: active
         if (referencePos != null) {
             val anchor = stuckAnchor
             if (anchor == null || anchor.distanceTo(referencePos) > 0.03f) {
                 stuckAnchor = referencePos
                 stuckStartMs = now
-            } else if (now - stuckStartMs > 2200L && now - lastPassMs >= PASS_COOLDOWN_MS) {
+            } else if (now - stuckStartMs > 2400L && now - lastPassMs >= PASS_COOLDOWN_MS) {
                 stuckStartMs = now
                 lastPassMs = now
-                val escapePitchAngle = if (referencePos.y > 0f) -0.9f else 0.9f
+                clearPendingPass()
+                val escapePitchAngle = if (referencePos.y > 0f) -0.78f else 0.78f
                 val screenAngle = smoothScreenAngle(pitchToScreenAngle(escapePitchAngle, mm.attackingRight))
                 return BotAction(
                     state = TacticalState.ATTACK_LOW_PASS,
@@ -139,150 +127,153 @@ class TacticalDecisionEngine {
                     joystickAngleRad = screenAngle,
                     joystickMagnitude = 1.0f,
                     button = ActionButton.B_LOW_PASS_OR_PRESS,
-                    buttonHoldMs = 150L,
+                    buttonHoldMs = 90L,
                     debugNote = "Anti-Stuck B"
                 )
             }
         }
 
-        // 4. Route to Attacking vs Defending FSM
         return when (state.possession) {
-            PossessionState.ALLY -> decideAttack(state, config)
-            PossessionState.OPPONENT, PossessionState.LOOSE_BALL -> decideDefend(state, config)
+            PossessionState.ALLY -> decideAttack(state)
+            PossessionState.OPPONENT, PossessionState.LOOSE_BALL -> {
+                clearPendingPass()
+                decideDefend(state, config)
+            }
         }
     }
 
-    private fun decideAttack(state: GameState, config: BotConfig): BotAction {
+    private fun decideAttack(state: GameState): BotAction {
         val now = state.timestampMs
         val mm = state.minimap
         val carrier = mm.activePlayer ?: mm.ball ?: NormalizedPoint(0f, 0f)
+        val ballPos = mm.ball ?: carrier
 
-        val shootXThreshold = when (config.tacticalMode) {
-            TacticalMode.AGGRESSIVE_ATTACK -> 0.58f
-            TacticalMode.AUTO_FARM_CAREER -> 0.65f
-            TacticalMode.COUNTER_ATTACK -> 0.66f
+        // Use the furthest-forward coordinate between active carrier and ball inside attacking third
+        val effectiveX = maxOf(carrier.x, ballPos.x)
+        val effectiveY = carrier.y
+
+        // =========================================================================
+        // PRIORITY #1: SHOOT ZONE (X >= 0.55 AND |Y| <= 0.60) -> OVERRIDES ALL!
+        // =========================================================================
+        if (effectiveX >= SHOOT_ZONE_MIN_X && abs(effectiveY) <= SHOOT_ZONE_MAX_ABS_Y) {
+            clearPendingPass()
+            // Aim at far corner away from goalkeeper
+            val aimY = if (effectiveY < 0f) -0.22f else 0.22f
+            val goalTarget = NormalizedPoint(1.0f, aimY)
+            val shootPitchAngle = atan2(goalTarget.y - effectiveY, goalTarget.x - effectiveX)
+            val screenAngle = pitchToScreenAngle(shootPitchAngle, mm.attackingRight)
+            // Snap EMA directly toward goal for instant accurate shot aim
+            snapEmaTo(screenAngle)
+
+            val holdMs = if (effectiveX >= CLOSE_RANGE_SHOOT_X) SHOOT_HOLD_CLOSE_MS else SHOOT_HOLD_MID_MS
+            val fireShot = (now - lastShootMs) >= SHOOT_COOLDOWN_MS
+            if (fireShot) {
+                lastShootMs = now
+            }
+
+            return BotAction(
+                state = TacticalState.ATTACK_SHOOT,
+                joystickActive = true,
+                joystickAngleRad = screenAngle,
+                joystickMagnitude = 1.0f,
+                button = if (fireShot) ActionButton.A_SHOOT_OR_TACKLE else ActionButton.NONE,
+                buttonHoldMs = if (fireShot) holdMs else 0L,
+                debugNote = "SHOOTING (A) ${holdMs}ms"
+            )
         }
-        val pressureRadius = when (config.tacticalMode) {
-            TacticalMode.AGGRESSIVE_ATTACK -> 0.16f
-            TacticalMode.AUTO_FARM_CAREER -> 0.19f
-            TacticalMode.COUNTER_ATTACK -> 0.22f
+
+        // =========================================================================
+        // PRIORITY #2: FORWARD SPACE ANALYSIS (±35° cone toward opponent goal)
+        // =========================================================================
+        val nearestFrontOppDist = findNearestForwardConeThreat(carrier, mm.opponents, FRONT_CONE_HALF_RAD)
+        val trappedOnSideline = abs(carrier.y) > SIDELINE_TRAP_Y
+        val underDangerPressure = nearestFrontOppDist <= FRONT_DANGER_DIST || trappedOnSideline
+
+        // DEFAULT BEHAVIOR: If front cone is clear (> 0.18) and not trapped -> NEVER PASS, DRIBBLE STRAIGHT!
+        if (!underDangerPressure) {
+            clearPendingPass()
+            val goalPitchAngle = atan2(0f - carrier.y, 1.0f - carrier.x)
+            val screenAngle = smoothScreenAngle(pitchToScreenAngle(goalPitchAngle, mm.attackingRight))
+            return BotAction(
+                state = TacticalState.ATTACK_DRIBBLE,
+                joystickActive = true,
+                joystickAngleRad = screenAngle,
+                joystickMagnitude = 1.0f,
+                button = ActionButton.NONE,
+                debugNote = "Sprint Goal (front=%.2f)".format(nearestFrontOppDist)
+            )
         }
-        val safeRadius = pressureRadius + 0.07f
 
-        // A. Final Third Finishing -> Shoot with Button A
-        if (carrier.x > shootXThreshold && abs(carrier.y) < 0.62f) {
-            val targetPostY = if (carrier.y >= 0f) -0.22f else 0.22f
-            val goalTarget = NormalizedPoint(1.0f, targetPostY)
-            if (!isLaneBlocked(carrier, goalTarget, mm.opponents, 0.085f)) {
-                val shootPitchAngle = atan2(goalTarget.y - carrier.y, goalTarget.x - carrier.x)
-                val screenAngle = smoothScreenAngle(pitchToScreenAngle(shootPitchAngle, mm.attackingRight))
-                val distToGoal = carrier.distanceTo(goalTarget)
-                val holdMs = (180f + ((distToGoal - 0.15f).coerceIn(0f, 0.55f) / 0.55f) * 170f)
-                    .toLong().coerceIn(180L, 350L)
+        // =========================================================================
+        // PRIORITY #3: PURPOSEFUL PASSING (ALL 3 STRICT CONDITIONS)
+        // =========================================================================
+        val cooldownReady = (now - lastPassMs) >= PASS_COOLDOWN_MS
+        val bestMate = if (cooldownReady) findBestSafePassTarget(carrier, mm.allies, mm.opponents) else null
 
-                val btn = if (now - lastShootMs >= SHOOT_COOLDOWN_MS) {
-                    lastShootMs = now
-                    ActionButton.A_SHOOT_OR_TACKLE
-                } else {
-                    ActionButton.NONE
-                }
+        if (bestMate != null) {
+            val passPitchAngle = atan2(bestMate.y - carrier.y, bestMate.x - carrier.x)
+            val screenAngle = pitchToScreenAngle(passPitchAngle, mm.attackingRight)
+            snapEmaTo(screenAngle)
+
+            // Condition 3: Pre-aim joystick toward teammate for at least 80ms before pressing B or C
+            if (pendingPassStartMs == 0L || pendingPassTarget == null || pendingPassTarget!!.distanceTo(bestMate) > 0.18f) {
+                pendingPassStartMs = now
+                pendingPassTarget = bestMate
                 return BotAction(
-                    state = TacticalState.ATTACK_SHOOT,
+                    state = TacticalState.ATTACK_LOW_PASS,
                     joystickActive = true,
                     joystickAngleRad = screenAngle,
                     joystickMagnitude = 1.0f,
-                    button = btn,
-                    buttonHoldMs = if (btn != ActionButton.NONE) holdMs else 0L,
-                    debugNote = "Shoot A ${holdMs}ms"
+                    button = ActionButton.NONE,
+                    debugNote = "Aim Pass (${now - pendingPassStartMs}ms)"
                 )
             }
-        }
 
-        // B. Wing Crossing -> Lofted Cross with Button C into penalty box
-        val onWingInFinalThird = carrier.x > 0.55f && abs(carrier.y) > 0.48f
-        if (onWingInFinalThird && now - lastPassMs >= PASS_COOLDOWN_MS) {
-            val boxTarget = findBestCrossTarget(carrier, mm.allies)
-            if (boxTarget != null) {
-                val crossPitchAngle = atan2(boxTarget.y - carrier.y, boxTarget.x - carrier.x)
-                val screenAngle = smoothScreenAngle(pitchToScreenAngle(crossPitchAngle, mm.attackingRight))
-                val crossDist = carrier.distanceTo(boxTarget)
-                val holdMs = (160L + (crossDist * 110f).toLong()).coerceIn(160L, 260L)
+            if (now - pendingPassStartMs >= PASS_PRE_AIM_MS) {
+                val isWingCross = abs(carrier.y) > 0.65f && carrier.x > 0.45f
                 lastPassMs = now
+                clearPendingPass()
                 return BotAction(
-                    state = TacticalState.ATTACK_LOFTED_CROSS,
+                    state = if (isWingCross) TacticalState.ATTACK_LOFTED_CROSS else TacticalState.ATTACK_LOW_PASS,
                     joystickActive = true,
                     joystickAngleRad = screenAngle,
-                    joystickMagnitude = 0.95f,
-                    button = ActionButton.C_LOFTED_PASS_OR_SWITCH,
-                    buttonHoldMs = holdMs,
-                    debugNote = "Wing Cross C"
+                    joystickMagnitude = 1.0f,
+                    button = if (isWingCross) ActionButton.C_LOFTED_PASS_OR_SWITCH else ActionButton.B_LOW_PASS_OR_PRESS,
+                    buttonHoldMs = if (isWingCross) CROSS_HOLD_MS else LOW_PASS_HOLD_MS,
+                    debugNote = if (isWingCross) "Wing Cross C 180ms" else "Low Pass B 90ms"
                 )
-            }
-        }
-
-        // C. Space Analysis (Forward cone toward opponent goal)
-        val nearestOppDist = mm.opponents.minOfOrNull { it.distanceTo(carrier) } ?: 2.0f
-        val forwardConeThreat = findNearestForwardConeThreat(carrier, mm.opponents)
-
-        // D. Smart Passing: B (Low Pass) vs C (Lofted Long Pass) when under pressure or lane blocked
-        val underPressure = nearestOppDist <= pressureRadius || forwardConeThreat <= pressureRadius + 0.04f
-        if (underPressure && now - lastPassMs >= PASS_COOLDOWN_MS) {
-            val bestMate = findBestPassTarget(carrier, mm.allies, mm.opponents, config.tacticalMode)
-            if (bestMate != null) {
-                val dx = bestMate.x - carrier.x
-                val dy = bestMate.y - carrier.y
-                val passDist = hypot(dx, dy)
-                val groundBlocked = isLaneBlocked(carrier, bestMate, mm.opponents, 0.065f)
-                val mateSpaceAhead = mm.opponents.minOfOrNull {
-                    it.distanceTo(NormalizedPoint((bestMate.x + 0.16f).coerceAtMost(1f), bestMate.y))
-                } ?: 1.0f
-
-                // Use Lofted Pass (C) for long forward switches or when ground lane is blocked
-                val useLoftedPass = (passDist > 0.36f && dx > 0.20f && mateSpaceAhead > 0.18f) ||
-                    (groundBlocked && passDist > 0.28f && dx > 0.12f)
-
-                val aimX = if (useLoftedPass) (bestMate.x + 0.10f).coerceAtMost(0.98f) else bestMate.x
-                val passPitchAngle = atan2(bestMate.y - carrier.y, aimX - carrier.x)
-                val screenAngle = smoothScreenAngle(pitchToScreenAngle(passPitchAngle, mm.attackingRight))
-
-                lastPassMs = now
-                val holdMs = if (useLoftedPass) {
-                    (150L + (passDist * 130f).toLong()).coerceIn(150L, 270L)
-                } else {
-                    (100L + (passDist * 90f).toLong()).coerceIn(100L, 190L)
-                }
-
+            } else {
                 return BotAction(
-                    state = if (useLoftedPass) TacticalState.ATTACK_LOFTED_CROSS else TacticalState.ATTACK_LOW_PASS,
+                    state = TacticalState.ATTACK_LOW_PASS,
                     joystickActive = true,
                     joystickAngleRad = screenAngle,
-                    joystickMagnitude = 0.95f,
-                    button = if (useLoftedPass) ActionButton.C_LOFTED_PASS_OR_SWITCH else ActionButton.B_LOW_PASS_OR_PRESS,
-                    buttonHoldMs = holdMs,
-                    debugNote = if (useLoftedPass) "Lofted Pass C" else "Low Pass B"
+                    joystickMagnitude = 1.0f,
+                    button = ActionButton.NONE,
+                    debugNote = "Aiming Pass..."
                 )
             }
         }
 
-        // E. Dribble / Sprint into Open Space toward Opponent Goal
-        var targetY = carrier.y * 0.45f
-        if (nearestOppDist < safeRadius) {
-            val closestOpp = mm.opponents.minByOrNull { it.distanceTo(carrier) }
-            if (closestOpp != null) {
-                targetY += if (closestOpp.y > carrier.y) -0.28f else 0.28f
-            }
+        // =========================================================================
+        // FALLBACK: NO SAFE TEAMMATE -> DO NOT PASS BLINDLY; EVADE ±45° TO OPEN FLANK
+        // =========================================================================
+        clearPendingPass()
+        val upperOpps = mm.opponents.count { it.x > carrier.x - 0.10f && it.y < carrier.y }
+        val lowerOpps = mm.opponents.count { it.x > carrier.x - 0.10f && it.y >= carrier.y }
+        val evadePitchAngle = when {
+            carrier.y > 0.72f -> -0.7854f // -45 deg (cut inward from bottom sideline)
+            carrier.y < -0.72f -> 0.7854f // +45 deg (cut inward from top sideline)
+            upperOpps <= lowerOpps -> -0.7854f
+            else -> 0.7854f
         }
-        targetY = targetY.coerceIn(-0.75f, 0.75f)
-        val dribblePitchAngle = atan2(targetY - carrier.y, 1.0f - carrier.x)
-        val screenAngle = smoothScreenAngle(pitchToScreenAngle(dribblePitchAngle, mm.attackingRight))
-
+        val evadeScreenAngle = smoothScreenAngle(pitchToScreenAngle(evadePitchAngle, mm.attackingRight))
         return BotAction(
             state = TacticalState.ATTACK_DRIBBLE,
             joystickActive = true,
-            joystickAngleRad = screenAngle,
+            joystickAngleRad = evadeScreenAngle,
             joystickMagnitude = 1.0f,
             button = ActionButton.NONE,
-            debugNote = "Dribble (opp=%.2f)".format(nearestOppDist)
+            debugNote = "Evade ±45°"
         )
     }
 
@@ -313,7 +304,7 @@ class TacticalDecisionEngine {
                 state = TacticalState.DEFEND_JOCKEY,
                 joystickActive = true,
                 joystickAngleRad = fallbackAngle,
-                joystickMagnitude = 0.9f,
+                joystickMagnitude = 1.0f,
                 debugNote = "Defend Track"
             )
         }
@@ -327,26 +318,23 @@ class TacticalDecisionEngine {
         val moveAnglePitch = atan2(intercept.y - active.y, intercept.x - active.x)
         val screenAngle = smoothScreenAngle(pitchToScreenAngle(moveAnglePitch, mm.attackingRight))
 
-        // Switch player (C) if active defender is beaten
+        // Switch Player (C) if beaten
         if (isBeaten && betterDefenderExists && now - lastSwitchMs >= SWITCH_COOLDOWN_MS) {
             lastSwitchMs = now
             return BotAction(
                 state = TacticalState.DEFEND_SWITCH_PLAYER,
                 joystickActive = true,
                 joystickAngleRad = screenAngle,
-                joystickMagnitude = 0.9f,
+                joystickMagnitude = 1.0f,
                 button = ActionButton.C_LOFTED_PASS_OR_SWITCH,
                 buttonHoldMs = 70L,
-                debugNote = "Switch Defender C"
+                debugNote = "Switch C"
             )
         }
 
-        // Slide Tackle (A) when close to opponent carrier & outside own penalty box
-        val tackleRadius = 0.12f
-        val pressRadius = 0.26f
+        // Slide Tackle (A) only when close, outside own box, and not beaten
         val outsideOwnBox = active.x > -0.66f
-
-        if (distToBall < tackleRadius && outsideOwnBox && !isBeaten && now - lastTackleMs >= TACKLE_COOLDOWN_MS) {
+        if (distToBall < 0.12f && outsideOwnBox && !isBeaten && now - lastTackleMs >= TACKLE_COOLDOWN_MS) {
             lastTackleMs = now
             return BotAction(
                 state = TacticalState.DEFEND_TACKLE,
@@ -355,21 +343,21 @@ class TacticalDecisionEngine {
                 joystickMagnitude = 1.0f,
                 button = ActionButton.A_SHOOT_OR_TACKLE,
                 buttonHoldMs = 95L,
-                debugNote = "Slide Tackle A"
+                debugNote = "Tackle A"
             )
         }
 
         // Press (B) when within pressing radius
-        if (distToBall < pressRadius && now - lastPassMs >= 320L) {
-            lastPassMs = now
+        if (distToBall < 0.26f && now - lastPressMs >= PRESS_COOLDOWN_MS) {
+            lastPressMs = now
             return BotAction(
                 state = TacticalState.DEFEND_PRESS,
                 joystickActive = true,
                 joystickAngleRad = screenAngle,
                 joystickMagnitude = 1.0f,
                 button = ActionButton.B_LOW_PASS_OR_PRESS,
-                buttonHoldMs = 210L,
-                debugNote = "Press B (d=%.2f)".format(distToBall)
+                buttonHoldMs = 200L,
+                debugNote = "Press B"
             )
         }
 
@@ -377,29 +365,16 @@ class TacticalDecisionEngine {
             state = TacticalState.DEFEND_JOCKEY,
             joystickActive = true,
             joystickAngleRad = screenAngle,
-            joystickMagnitude = 0.95f,
+            joystickMagnitude = 1.0f,
             button = ActionButton.NONE,
-            debugNote = "Jockey Intercept"
+            debugNote = "Jockey"
         )
-    }
-
-    private fun findBestCrossTarget(
-        carrier: NormalizedPoint,
-        allies: List<NormalizedPoint>
-    ): NormalizedPoint? {
-        return allies
-            .filter { mate ->
-                mate != carrier &&
-                    mate.x in 0.55f..0.95f &&
-                    abs(mate.y) < 0.42f &&
-                    carrier.distanceTo(mate) > 0.25f
-            }
-            .maxByOrNull { it.x - abs(it.y) * 0.4f }
     }
 
     private fun findNearestForwardConeThreat(
         carrier: NormalizedPoint,
-        opponents: List<NormalizedPoint>
+        opponents: List<NormalizedPoint>,
+        halfConeRad: Float
     ): Float {
         var nearest = 2.0f
         for (opp in opponents) {
@@ -408,38 +383,37 @@ class TacticalDecisionEngine {
             val dy = opp.y - carrier.y
             val dist = hypot(dx, dy)
             val angle = abs(atan2(dy, dx))
-            if (angle <= 0.72f && dist < nearest) {
+            if (angle <= halfConeRad && dist < nearest) {
                 nearest = dist
             }
         }
         return nearest
     }
 
-    private fun findBestPassTarget(
+    /**
+     * Condition 2: Only considers forward teammates (ally.x > player.x - 0.05 unless trapped in own box < -0.65),
+     * distance in [0.15, 0.75], and strictly unblocked passing lane (> 0.08 clearance from all opponents).
+     */
+    private fun findBestSafePassTarget(
         carrier: NormalizedPoint,
         allies: List<NormalizedPoint>,
-        opponents: List<NormalizedPoint>,
-        mode: TacticalMode
+        opponents: List<NormalizedPoint>
     ): NormalizedPoint? {
+        val allowBackPass = carrier.x < -0.65f
         var bestMate: NormalizedPoint? = null
         var bestScore = Float.NEGATIVE_INFINITY
 
-        val forwardWeight = when (mode) {
-            TacticalMode.AGGRESSIVE_ATTACK -> 1.8f
-            TacticalMode.COUNTER_ATTACK -> 1.5f
-            TacticalMode.AUTO_FARM_CAREER -> 1.35f
-        }
-
         for (mate in allies) {
             val dist = carrier.distanceTo(mate)
-            if (dist < 0.08f || dist > 0.95f) continue
+            if (dist < 0.15f || dist > 0.75f) continue
+            if (!allowBackPass && mate.x <= carrier.x - 0.05f) continue
+            if (isLaneBlocked(carrier, mate, opponents, PASS_LANE_CLEARANCE)) continue
 
             val progress = mate.x - carrier.x
             val openness = opponents.minOfOrNull { it.distanceTo(mate) } ?: 0.5f
-            val lanePenalty = if (isLaneBlocked(carrier, mate, opponents, 0.07f)) -0.85f else 0f
             val centerBonus = (1f - abs(mate.y)) * 0.25f
+            val score = progress * 1.8f + openness * 1.5f + centerBonus
 
-            val score = progress * forwardWeight + openness * 1.65f + centerBonus + lanePenalty
             if (score > bestScore) {
                 bestScore = score
                 bestMate = mate
@@ -452,7 +426,7 @@ class TacticalDecisionEngine {
         from: NormalizedPoint,
         to: NormalizedPoint,
         opponents: List<NormalizedPoint>,
-        corridorHalfWidth: Float
+        minClearance: Float
     ): Boolean {
         val segDx = to.x - from.x
         val segDy = to.y - from.y
@@ -461,11 +435,12 @@ class TacticalDecisionEngine {
 
         for (opp in opponents) {
             val t = (((opp.x - from.x) * segDx + (opp.y - from.y) * segDy) / segLenSq)
-            if (t <= 0.1f || t >= 0.95f) continue
+            if (t <= 0.05f || t >= 0.98f) continue
             val projX = from.x + t * segDx
             val projY = from.y + t * segDy
-            val perpDist = hypot(opp.x - projX, opp.y - projY)
-            if (perpDist < corridorHalfWidth) return true
+            if (hypot(opp.x - projX, opp.y - projY) <= minClearance) {
+                return true
+            }
         }
         return false
     }
@@ -485,7 +460,7 @@ class TacticalDecisionEngine {
             emaSin = s
             hasEma = true
         } else {
-            val alpha = 0.38f
+            val alpha = 0.35f
             emaCos = emaCos * (1f - alpha) + c * alpha
             emaSin = emaSin * (1f - alpha) + s * alpha
             val norm = hypot(emaCos, emaSin)
@@ -497,17 +472,46 @@ class TacticalDecisionEngine {
         return atan2(emaSin, emaCos)
     }
 
+    private fun snapEmaTo(angleRad: Float) {
+        emaCos = cos(angleRad)
+        emaSin = sin(angleRad)
+        hasEma = true
+    }
+
+    private fun clearPendingPass() {
+        pendingPassStartMs = 0L
+        pendingPassTarget = null
+    }
+
     fun resetTracking() {
         hasEma = false
         stuckAnchor = null
         stuckStartMs = 0L
+        clearPendingPass()
     }
 
     companion object {
-        private const val PASS_COOLDOWN_MS = 400L
-        private const val SHOOT_COOLDOWN_MS = 600L
-        private const val SWITCH_COOLDOWN_MS = 500L
-        private const val TACKLE_COOLDOWN_MS = 700L
-        private const val MENU_COOLDOWN_MS = 1500L
+        // Shoot Zone & Priority #1 parameters
+        private const val SHOOT_ZONE_MIN_X = 0.55f
+        private const val CLOSE_RANGE_SHOOT_X = 0.75f
+        private const val SHOOT_ZONE_MAX_ABS_Y = 0.60f
+        private const val SHOOT_HOLD_CLOSE_MS = 180L
+        private const val SHOOT_HOLD_MID_MS = 280L
+        private const val SHOOT_COOLDOWN_MS = 900L
+
+        // Dribble & Strict Passing parameters
+        private const val FRONT_CONE_HALF_RAD = 0.61086524f // ±35 degrees
+        private const val FRONT_DANGER_DIST = 0.18f
+        private const val SIDELINE_TRAP_Y = 0.85f
+        private const val PASS_LANE_CLEARANCE = 0.08f
+        private const val PASS_COOLDOWN_MS = 1100L
+        private const val PASS_PRE_AIM_MS = 80L
+        private const val LOW_PASS_HOLD_MS = 90L
+        private const val CROSS_HOLD_MS = 180L
+
+        // Defense cooldowns
+        private const val SWITCH_COOLDOWN_MS = 550L
+        private const val TACKLE_COOLDOWN_MS = 750L
+        private const val PRESS_COOLDOWN_MS = 350L
     }
 }

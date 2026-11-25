@@ -69,6 +69,10 @@ object BotRuntimeState {
     /**
      * Master permission gate checked before EVERY gesture dispatch.
      */
+    fun canDispatchTouch(isValidMinimap: Boolean = lastGameState.get()?.isValidMinimap == true): Boolean {
+        return canDispatchGesture(isValidMinimap)
+    }
+
     fun canDispatchGesture(isValidMinimap: Boolean): Boolean {
         return isCaptureRunning.get() &&
             isBotRunning.get() &&

@@ -13,18 +13,22 @@ import com.dls26.tacticalbot.model.ActionButton
 import com.dls26.tacticalbot.model.BotAction
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * Single-Chokepoint Multi-Touch Gesture Controller:
- * - ZERO local running flags — reads ONLY BotRuntimeState (Single Source of Truth).
- * - Every gesture passes through safeDispatchGesture(), which strictly blocks ANY touch
- *   unless BotRuntimeState.canDispatchGesture(isValidMinimap) == true.
- * - hardStopAndClear() cancels ALL pending Handler callbacks (removeCallbacksAndMessages(null)),
- *   clears queues, and lifts any held continueStroke with willContinue = false immediately.
+ * Continuous 1-Stroke Full-Radius Joystick + Multi-Touch Gesture Controller for DLS 26:
+ * - Stroke 0: Anchors at (joyCenterX, joyCenterY) and drags to 100% outer joyRadius in 60ms (willContinue = true).
+ * - Stroke N -> N+1: Continues directly from (currentX, currentY) to (newTargetX, newTargetY) on the 100% outer
+ *   circle for 120ms (willContinue = true) inside onCompleted() — never lifting or resetting to center.
+ * - Angle Pin (< 8 deg delta): Holds virtual thumb pinned at (currentX, currentY) -> (currentX + 0.5f, currentY)
+ *   for 120ms so the player sprints smoothly in a straight line without micro-stutters.
+ * - Multi-Touch: Combines continuing Joystick Stroke 1 + Action Button (A/B/C) Stroke 2 into one GestureDescription.
+ * - Strictly locked behind BotRuntimeState.canDispatchTouch().
  */
 class AutoTouchAccessibilityService : AccessibilityService() {
 
@@ -34,7 +38,6 @@ class AutoTouchAccessibilityService : AccessibilityService() {
         val isValidMinimap: Boolean,
         val screenWidth: Int,
         val screenHeight: Int,
-        val stepDurationMs: Long,
         val updatedAtMs: Long
     )
 
@@ -50,13 +53,14 @@ class AutoTouchAccessibilityService : AccessibilityService() {
     private val queuedButton = AtomicReference<PendingButton?>(null)
 
     private var activeJoystickStroke: GestureDescription.StrokeDescription? = null
-    private var lastJoyX: Float = 1f
-    private var lastJoyY: Float = 1f
+    private var currentJoyX: Float = 1f
+    private var currentJoyY: Float = 1f
+    private var lastJoyAngleRad: Float = 0f
+    private var hasLastAngle: Boolean = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        // Guarantee bot starts strictly PAUSED on service connect
         BotRuntimeState.setBotRunning(false)
         Log.i(TAG, "AutoTouchAccessibilityService connected (PAUSED by default).")
     }
@@ -81,9 +85,9 @@ class AutoTouchAccessibilityService : AccessibilityService() {
         isValidMinimap: Boolean,
         screenWidth: Int,
         screenHeight: Int,
-        frameIntervalMs: Long
+        @Suppress("UNUSED_PARAMETER") frameIntervalMs: Long
     ) {
-        if (!BotRuntimeState.canDispatchGesture(isValidMinimap)) {
+        if (!BotRuntimeState.canDispatchTouch(isValidMinimap)) {
             hardStopAndClear()
             return
         }
@@ -99,7 +103,6 @@ class AutoTouchAccessibilityService : AccessibilityService() {
                 isValidMinimap = true,
                 screenWidth = landscapeW,
                 screenHeight = landscapeH,
-                stepDurationMs = frameIntervalMs.coerceIn(50L, 80L),
                 updatedAtMs = now
             )
         )
@@ -113,13 +116,11 @@ class AutoTouchAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Immediately purges all queued Handler callbacks & commands and lifts any held stroke.
-     */
     fun hardStopAndClear() {
         isLoopActive.set(false)
         latestCommand.set(null)
         queuedButton.set(null)
+        hasLastAngle = false
         mainHandler.removeCallbacksAndMessages(null)
         mainHandler.post {
             val stroke = activeJoystickStroke
@@ -127,13 +128,13 @@ class AutoTouchAccessibilityService : AccessibilityService() {
             if (stroke != null) {
                 try {
                     val path = Path().apply {
-                        moveTo(lastJoyX, lastJoyY)
-                        lineTo(lastJoyX, lastJoyY)
+                        moveTo(currentJoyX, currentJoyY)
+                        lineTo(currentJoyX, currentJoyY)
                     }
                     val endStroke = stroke.continueStroke(path, 0L, 30L, false)
                     dispatchGesture(GestureDescription.Builder().addStroke(endStroke).build(), null, null)
                 } catch (_: Exception) {
-                    // Ignore if service is tearing down
+                    // Safe ignore on teardown
                 }
             }
         }
@@ -143,11 +144,10 @@ class AutoTouchAccessibilityService : AccessibilityService() {
         val cmd = latestCommand.get()
         val now = System.currentTimeMillis()
 
-        // Hard Gate right before building & dispatching gesture
         if (!isLoopActive.get() ||
             cmd == null ||
-            !BotRuntimeState.canDispatchGesture(cmd.isValidMinimap) ||
-            (now - cmd.updatedAtMs) > 380L
+            !BotRuntimeState.canDispatchTouch(cmd.isValidMinimap) ||
+            (now - cmd.updatedAtMs) > 420L
         ) {
             hardStopAndClear()
             return
@@ -158,57 +158,78 @@ class AutoTouchAccessibilityService : AccessibilityService() {
         val cfg = cmd.config
         val action = cmd.action
 
-        val btnItem = queuedButton.getAndSet(null)?.takeIf { (now - it.queuedAtMs) <= 280L }
-        val buttonHoldMs = btnItem?.holdMs?.coerceIn(50L, 380L) ?: 0L
-        val stepMs = max(cmd.stepDurationMs, buttonHoldMs).coerceIn(50L, 380L)
+        val btnItem = queuedButton.getAndSet(null)?.takeIf { (now - it.queuedAtMs) <= 300L }
+        val buttonHoldMs = btnItem?.holdMs?.coerceIn(60L, 350L) ?: 0L
 
         val builder = GestureDescription.Builder()
         var hasStroke = false
 
-        // Stroke 1: Continuous Joystick Drag (willContinue = true)
+        // Stroke 1: Continuous Full-Radius (100% joyRadius) Joystick Drag
         val joyCenterX = (cfg.joystickCenterX * w).coerceIn(1f, w - 1f)
         val joyCenterY = (cfg.joystickCenterY * h).coerceIn(1f, h - 1f)
         val joyRadius = cfg.joystickRadiusNorm * min(w, h)
 
         if (action.joystickActive) {
-            val targetX = (joyCenterX + cos(action.joystickAngleRad) * joyRadius * action.joystickMagnitude)
-                .coerceIn(1f, w - 1f)
-            val targetY = (joyCenterY + sin(action.joystickAngleRad) * joyRadius * action.joystickMagnitude)
-                .coerceIn(1f, h - 1f)
+            val targetAngle = action.joystickAngleRad
+            val fullTargetX = (joyCenterX + cos(targetAngle) * joyRadius).coerceIn(1f, w - 1f)
+            val fullTargetY = (joyCenterY + sin(targetAngle) * joyRadius).coerceIn(1f, h - 1f)
 
             val prev = activeJoystickStroke
             val path = Path()
-            val nextStroke = if (prev == null) {
+            val nextStroke: GestureDescription.StrokeDescription
+
+            if (prev == null) {
+                // Stroke 0: Drag straight from Joystick center to 100% outer radius in 60ms (willContinue = true)
+                val initDurationMs = max(INIT_STROKE_MS, buttonHoldMs)
                 path.moveTo(joyCenterX, joyCenterY)
-                path.lineTo(targetX, targetY)
-                GestureDescription.StrokeDescription(path, 0L, stepMs, true)
+                path.lineTo(fullTargetX, fullTargetY)
+                nextStroke = GestureDescription.StrokeDescription(path, 0L, initDurationMs, true)
+                currentJoyX = fullTargetX
+                currentJoyY = fullTargetY
+                lastJoyAngleRad = targetAngle
+                hasLastAngle = true
             } else {
-                val startX = lastJoyX.coerceIn(1f, w - 1f)
-                val startY = lastJoyY.coerceIn(1f, h - 1f)
-                val midX = (startX + (targetX - startX) * 0.6f).coerceIn(1f, w - 1f)
-                val midY = (startY + (targetY - startY) * 0.6f).coerceIn(1f, h - 1f)
-                path.moveTo(startX, startY)
-                path.quadTo(midX, midY, targetX, targetY)
-                prev.continueStroke(path, 0L, stepMs, true)
+                // Stroke N -> N+1: Continue seamlessly on outer circle for 120ms (or buttonHoldMs if longer)
+                val contDurationMs = max(CONTINUE_STROKE_MS, buttonHoldMs)
+                val startX = currentJoyX.coerceIn(1f, w - 1f)
+                val startY = currentJoyY.coerceIn(1f, h - 1f)
+                val angleDelta = if (hasLastAngle) abs(normalizeAngleDelta(targetAngle - lastJoyAngleRad)) else Float.MAX_VALUE
+
+                if (angleDelta < SMALL_ANGLE_PIN_RAD) {
+                    // Hold thumb pinned tightly in 1 continuous stroke (+0.5f micro-shift keeps gesture alive)
+                    val pinX = (if (startX + 0.5f < w - 1f) startX + 0.5f else startX - 0.5f).coerceIn(1f, w - 1f)
+                    path.moveTo(startX, startY)
+                    path.lineTo(pinX, startY)
+                    nextStroke = prev.continueStroke(path, 0L, contDurationMs, true)
+                    currentJoyX = pinX
+                    currentJoyY = startY
+                } else {
+                    path.moveTo(startX, startY)
+                    path.lineTo(fullTargetX, fullTargetY)
+                    nextStroke = prev.continueStroke(path, 0L, contDurationMs, true)
+                    currentJoyX = fullTargetX
+                    currentJoyY = fullTargetY
+                    lastJoyAngleRad = targetAngle
+                    hasLastAngle = true
+                }
             }
 
             activeJoystickStroke = nextStroke
-            lastJoyX = targetX
-            lastJoyY = targetY
             builder.addStroke(nextStroke)
             hasStroke = true
         } else if (activeJoystickStroke != null) {
             val releasePath = Path().apply {
-                moveTo(lastJoyX.coerceIn(1f, w - 1f), lastJoyY.coerceIn(1f, h - 1f))
+                moveTo(currentJoyX.coerceIn(1f, w - 1f), currentJoyY.coerceIn(1f, h - 1f))
                 lineTo(joyCenterX, joyCenterY)
             }
             val endStroke = activeJoystickStroke!!.continueStroke(releasePath, 0L, 35L, false)
             activeJoystickStroke = null
+            hasLastAngle = false
             builder.addStroke(endStroke)
             hasStroke = true
         }
 
-        // Stroke 2: Simultaneous Multi-Touch Action Button (A / B / C)
+        // Stroke 2: Simultaneous Multi-Touch Action Button (A = Shoot/Tackle, B = Low Pass/Press, C = Cross/Switch)
         if (btnItem != null && btnItem.button != ActionButton.NONE && btnItem.button != ActionButton.MENU_CONTINUE) {
             val (bxNorm, byNorm) = when (btnItem.button) {
                 ActionButton.A_SHOOT_OR_TACKLE -> cfg.buttonAX to cfg.buttonAY
@@ -237,12 +258,8 @@ class AutoTouchAccessibilityService : AccessibilityService() {
         safeDispatchGesture(builder.build(), cmd.isValidMinimap)
     }
 
-    /**
-     * Single chokepoint for all active bot gestures.
-     */
     private fun safeDispatchGesture(gesture: GestureDescription, isValidMinimap: Boolean) {
-        if (!BotRuntimeState.canDispatchGesture(isValidMinimap)) {
-            Log.w(TAG, "Blocked gesture dispatch: bot not running / settings open / invalid minimap.")
+        if (!BotRuntimeState.canDispatchTouch(isValidMinimap)) {
             hardStopAndClear()
             return
         }
@@ -252,10 +269,7 @@ class AutoTouchAccessibilityService : AccessibilityService() {
                 gesture,
                 object : GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) {
-                        if (isLoopActive.get() &&
-                            BotRuntimeState.isBotRunning.get() &&
-                            !BotRuntimeState.isSettingsOpen.get()
-                        ) {
+                        if (isLoopActive.get() && BotRuntimeState.canDispatchTouch()) {
                             mainHandler.post { dispatchNextChainedStep() }
                         } else {
                             hardStopAndClear()
@@ -264,11 +278,9 @@ class AutoTouchAccessibilityService : AccessibilityService() {
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
                         activeJoystickStroke = null
-                        if (isLoopActive.get() &&
-                            BotRuntimeState.isBotRunning.get() &&
-                            !BotRuntimeState.isSettingsOpen.get()
-                        ) {
-                            mainHandler.postDelayed({ dispatchNextChainedStep() }, 45L)
+                        hasLastAngle = false
+                        if (isLoopActive.get() && BotRuntimeState.canDispatchTouch()) {
+                            mainHandler.postDelayed({ dispatchNextChainedStep() }, 40L)
                         } else {
                             isLoopActive.set(false)
                         }
@@ -278,17 +290,30 @@ class AutoTouchAccessibilityService : AccessibilityService() {
             )
             if (!ok) {
                 activeJoystickStroke = null
+                hasLastAngle = false
                 isLoopActive.set(false)
             }
         } catch (e: Exception) {
             Log.e(TAG, "dispatchGesture exception: ${e.message}")
             activeJoystickStroke = null
+            hasLastAngle = false
             isLoopActive.set(false)
         }
     }
 
+    private fun normalizeAngleDelta(deltaRad: Float): Float {
+        var d = deltaRad
+        val twoPi = (2.0 * PI).toFloat()
+        while (d > PI) d -= twoPi
+        while (d < -PI) d += twoPi
+        return d
+    }
+
     companion object {
         private const val TAG = "AutoTouchService"
+        private const val INIT_STROKE_MS = 60L
+        private const val CONTINUE_STROKE_MS = 120L
+        private const val SMALL_ANGLE_PIN_RAD = 0.13962634f // 8 degrees in radians
 
         @Volatile
         var instance: AutoTouchAccessibilityService? = null
